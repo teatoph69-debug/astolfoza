@@ -238,7 +238,7 @@ export class MenuScreen extends Screen {
 
   resize() {
     const narrow = window.innerWidth < 900;
-    this.bg.set({ focusX: narrow ? 0.5 : 0.7, focusY: narrow ? 0.3 : 0.46, gridScale: narrow ? 0.85 : 1 });
+    this.bg.set({ focusX: narrow ? 0.5 : 0.69, focusY: narrow ? 0.17 : 0.43, gridScale: narrow ? 0.72 : 0.95, intensity: narrow ? 0.75 : 1 });
     this.bg.resize();
   }
 
@@ -646,7 +646,7 @@ export class MenuScreen extends Screen {
     if (!b) return;
     const wanted = this._musicWanted();
     const state = !wanted ? 'off' : this._musicState === 'loading' ? 'loading' : this._musicPlaying() ? 'on' : 'idle';
-    b.className = 'menu-top-btn menu-music ' + state;
+    b.className = 'menu-top-btn menu-music is-' + state;
     clear(b).append(
       state === 'off' ? icon('musicOff') : h('span.menu-eq', h('i'), h('i'), h('i'), h('i')),
       h('span.menu-music-label', state === 'off' ? tr('Музыка выкл.', 'Music off') : state === 'loading' ? tr('Загрузка…', 'Loading…') : tr('Музыка', 'Music')));

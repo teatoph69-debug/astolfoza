@@ -1818,11 +1818,86 @@ function makeImpulse(sr, seconds, damp, rnd) {
 // ════════════════════════════════════════════════════════════════════════════════════════════
 //  Rendering (browser only)
 // ════════════════════════════════════════════════════════════════════════════════════════════
+//
+// Pipeline:
+//   1. JS: synthesise drum one-shots and one buffer per distinct note / chord / riser.
+//   2. JS: block mixer (512 samples). Each instrument kind has a bus: sum of its voices →
+//      section-driven low-pass sweep (SVF) → kick-triggered sidechain ducking → level, with
+//      sends to a tempo-synced ping-pong delay (JS) and to the reverb.
+//   3. OfflineAudioContext at half rate: reverb send → high-pass → ConvolverNode (generated IR).
+//   4. JS: add the (ducked) reverb return, then the master bus (normalise → glue compressor →
+//      look-ahead limiter). No stage adds latency, so the audio stays aligned to event times.
+//
+// Why not one AudioBufferSourceNode per event? An OfflineAudioContext processes every scheduled
+// (not yet started) source on every render quantum, so a few thousand sources make a 2-minute
+// render take tens of seconds. Mixing pre-rendered voices in JS is ~100x cheaper.
 
 const yieldToUI = () => new Promise((r) => setTimeout(r, 0));
+const MIX_BLOCK = 512;
+const KIND_LIST = ['kick', 'snare', 'clap', 'hat', 'openhat', 'bass', 'lead', 'arp', 'chord', 'riser', 'impact'];
+const SWEPT = new Set(['bass', 'lead', 'arp', 'chord']);
+
+/** Kick-triggered ducking amount ("dip", 0..1), produced block by block. */
+function makeDipper(kicks, sr, bpm) {
+  const starts = kicks.map((k) => Math.round(k.t * sr));
+  const amts = kicks.map((k) => clamp(k.vel / 0.9, 0.4, 1));
+  const holdN = Math.round(0.02 * sr);
+  const atk = 1 - Math.exp(-1 / (0.003 * sr));
+  const rel = 1 - Math.exp(-1 / (Math.min(0.12, (60 / bpm) * 0.2) * sr));
+  let k = 0;
+  let dip = 0;
+  let target = 0;
+  let holdUntil = -1;
+  return (out, i0, len) => {
+    for (let j = 0; j < len; j++) {
+      const i = i0 + j;
+      while (k < starts.length && starts[k] <= i) {
+        target = amts[k];
+        holdUntil = starts[k] + holdN;
+        k++;
+      }
+      if (i < holdUntil) dip += (target - dip) * atk;
+      else dip -= dip * rel;
+      out[j] = dip;
+    }
+  };
+}
+
+/** Section-driven low-pass cutoff curve: closed intros, opening builds, open drops, dark breaks. */
+function makeSweep(sections) {
+  const segs = [];
+  let cur = 20000;
+  for (const s of sections) {
+    let f0 = 20000;
+    let f1 = 20000;
+    if (s.name === 'intro') { f0 = 500; f1 = 3200; }
+    else if (s.name === 'build') { f0 = cur; f1 = 19000; }
+    else if (s.name === 'break') { f0 = 900; f1 = 4000; }
+    else if (s.name === 'outro') { f0 = 20000; f1 = 1100; }
+    segs.push({ a: s.start, b: s.end, f0, f1 });
+    cur = f1;
+  }
+  let idx = 0;
+  return (t) => {
+    if (!segs.length) return 20000;
+    if (t < segs[0].a) return segs[0].f0;
+    while (idx < segs.length - 1 && t >= segs[idx].b) idx++;
+    const s = segs[idx];
+    if (t >= s.b) return s.f1;
+    return s.f0 * Math.pow(s.f1 / s.f0, (t - s.a) / (s.b - s.a));
+  };
+}
+
+function makeAudioBuffer(OAC, channels, length, sampleRate) {
+  try {
+    return new AudioBuffer({ numberOfChannels: channels, length, sampleRate });
+  } catch {
+    return new OAC(channels, 1, sampleRate).createBuffer(channels, length, sampleRate);
+  }
+}
 
 /**
- * Render a composition to a stereo AudioBuffer with an OfflineAudioContext.
+ * Render a composition to a stereo AudioBuffer. Browser only (needs OfflineAudioContext).
  * @param {object} comp  result of composeSong
  * @param {object} [opts]
  * @param {number} [opts.sampleRate=44100]
@@ -1833,9 +1908,10 @@ const yieldToUI = () => new Promise((r) => setTimeout(r, 0));
  * @returns {Promise<AudioBuffer>}
  */
 export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, master: doMaster = true, stats } = {}) {
-  const tStart = performance.now();
   const OAC = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if (!OAC) throw new Error('renderSong() needs the Web Audio API (OfflineAudioContext)');
+  const now = () => (globalThis.performance ? performance.now() : Date.now());
+  const tStart = now();
   const sr = sampleRate;
   const style = comp.def.style in PATCHES ? comp.def.style : 'synthwave';
   const PT = PATCHES[style];
@@ -1844,267 +1920,294 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
   const bpm = comp.bpm;
   const seed = (comp.def.seed >>> 0) || 1;
   const rnd = mulberry32(seed ^ 0x9e3779b9);
-  const length = Math.ceil(comp.duration * sr);
-  const ctx = new OAC(2, length, sr);
+  const N = Math.ceil(comp.duration * sr);
   const muted = new Set(mute || []);
-  const progress = (p) => { if (onProgress) try { onProgress(p); } catch { /* ignore */ } };
+  const progress = (p) => {
+    if (onProgress) try { onProgress(Math.min(1, p)); } catch { /* ignore listener errors */ }
+  };
+  let lastYield = now();
+  const maybeYield = async (p) => {
+    if (now() - lastYield > 30) {
+      progress(p);
+      await yieldToUI();
+      lastYield = now();
+    }
+  };
 
-  const toBuffer = (L, R) => {
-    const b = ctx.createBuffer(2, L.length, sr);
-    b.copyToChannel(L, 0);
-    b.copyToChannel(R || L, 1);
-    return b;
+  // ── 1. sounds ──
+  const normPeak = (chs) => {
+    const p = peakOf(...chs) || 1;
+    for (const c of chs) for (let i = 0; i < c.length; i++) c[i] /= p;
+    return chs;
   };
   const panMono = (x, pan) => {
     const a = ((pan + 1) * Math.PI) / 4;
-    const L = new Float32Array(x.length), R = new Float32Array(x.length);
-    const gl = Math.cos(a) * Math.SQRT2, gr = Math.sin(a) * Math.SQRT2;
+    const L = new Float32Array(x.length);
+    const R = new Float32Array(x.length);
+    const gl = Math.cos(a) * Math.SQRT2;
+    const gr = Math.sin(a) * Math.SQRT2;
     for (let i = 0; i < x.length; i++) { L[i] = x[i] * gl; R[i] = x[i] * gr; }
     return [L, R];
   };
-  const normPeak = (chs, target = 1) => {
-    const p = peakOf(...chs) || 1;
-    for (const c of chs) for (let i = 0; i < c.length; i++) c[i] *= target / p;
-    return chs;
+  const kick = normPeak([synthKick(KT.kick, sr, rnd)])[0];
+  const drums = {
+    kick: [kick, kick],
+    snare: normPeak(synthSnare(KT.snare, sr, rnd)),
+    clap: normPeak(synthClap(KT.clap, sr, rnd)),
+    hat: normPeak(panMono(synthHat(KT.hat, sr, rnd), MX.pan.hat)),
+    openhat: normPeak(panMono(synthHat(KT.openhat, sr, rnd), MX.pan.openhat)),
+    impact: normPeak(synthImpact(sr, rnd, style === 'chiptune')),
   };
 
-  // ── 1. drum one-shots ──
-  const drums = {};
-  {
-    const k = normPeak([synthKick(KT.kick, sr, rnd)]);
-    drums.kick = toBuffer(k[0], k[0]);
-    drums.snare = toBuffer(...normPeak(synthSnare(KT.snare, sr, rnd)));
-    drums.clap = toBuffer(...normPeak(synthClap(KT.clap, sr, rnd)));
-    drums.hat = toBuffer(...normPeak(panMono(synthHat(KT.hat, sr, rnd), MX.pan.hat)));
-    drums.openhat = toBuffer(...normPeak(panMono(synthHat(KT.openhat, sr, rnd), MX.pan.openhat)));
-    drums.impact = toBuffer(...normPeak(synthImpact(sr, rnd, style === 'chiptune')));
-  }
-  progress(0.05);
-
-  // ── 2. tonal voices (one buffer per distinct note / chord / riser) ──
+  // Tonal voices are loudness-normalised per patch (RMS of a reference note), so bus levels
+  // in MIX mean the same thing for every style.
   const norms = new Map();
   const REF = { lead: 72, arp: 72, chord: 64, bass: 40 };
   const patchNorm = (kind) => {
-    if (norms.has(kind)) return norms.get(kind);
-    const [L, R] = renderVoice(PT[kind], [REF[kind]], 0.5, { sr, bpm, wob: 0, vel: 1, seed: 7 });
-    let s = 0;
-    const m = Math.min(L.length, Math.floor(0.5 * sr));
-    for (let i = 0; i < m; i++) s += L[i] * L[i] + R[i] * R[i];
-    const rms = Math.sqrt(s / (2 * m)) || 1;
-    const g = 0.2 / rms;
-    norms.set(kind, g);
-    return g;
+    if (!norms.has(kind)) {
+      const [L, R] = renderVoice(PT[kind], [REF[kind]], 0.5, { sr, bpm, wob: 0, vel: 1, seed: 7 });
+      const m = Math.min(L.length, Math.floor(0.5 * sr));
+      let s = 0;
+      for (let i = 0; i < m; i++) s += L[i] * L[i] + R[i] * R[i];
+      norms.set(kind, 0.2 / (Math.sqrt(s / (2 * m)) || 1));
+    }
+    return norms.get(kind);
   };
   const cache = new Map();
-  let lastYield = performance.now();
-  const maybeYield = async (p) => {
-    if (performance.now() - lastYield > 40) {
-      progress(p);
-      await yieldToUI();
-      lastYield = performance.now();
-    }
-  };
-  const voiceBuffer = (kind, midis, dur, e) => {
+  const voice = (kind, midis, dur, e) => {
     const P = PT[kind];
     const velQ = P.flt && P.flt.vel ? Math.round((e.vel ?? 1) * 4) / 4 : 1;
-    const key = `${kind}|${midis.join(',')}|${Math.round(dur * 200)}|${e.wob ?? ''}|${velQ}`;
-    let b = cache.get(key);
-    if (!b) {
-      const [L, R] = renderVoice(P, midis, Math.round(dur * 200) / 200, {
-        sr, bpm, wob: e.wob || 0, vel: velQ, seed: hashString(key),
-      });
+    const durQ = Math.round(dur * 200) / 200;
+    const key = `${kind}|${midis.join(',')}|${durQ}|${e.wob ?? ''}|${velQ}`;
+    let v = cache.get(key);
+    if (!v) {
+      v = renderVoice(P, midis, durQ, { sr, bpm, wob: e.wob || 0, vel: velQ, seed: hashString(key) });
       const g = patchNorm(kind);
-      for (let i = 0; i < L.length; i++) { L[i] *= g; R[i] *= g; }
-      b = toBuffer(L, R);
-      cache.set(key, b);
+      for (const c of v) for (let i = 0; i < c.length; i++) c[i] *= g;
+      cache.set(key, v);
     }
-    return b;
+    return v;
   };
 
-  // Group chord notes that start together into one voice buffer.
-  const plays = []; // { t, kind, buf, gain }
+  const plays = []; // { s0, L, R, g, kind }
   const evs = comp.events;
   for (let i = 0; i < evs.length; i++) {
     const e = evs[i];
     if (muted.has(e.kind)) continue;
-    if (e.kind in drums) {
-      plays.push({ t: e.t, kind: e.kind, buf: drums[e.kind], gain: e.vel });
-    } else if (e.kind === 'riser') {
+    let buf = null;
+    let g = e.vel;
+    if (drums[e.kind]) buf = drums[e.kind];
+    else if (e.kind === 'riser') {
       const key = `riser|${Math.round(e.dur * 100)}`;
-      let b = cache.get(key);
-      if (!b) {
-        const [L, R] = synthRiser(e.dur, sr, mulberry32(hashString(key) ^ seed));
-        b = toBuffer(...normPeak([L, R]));
-        cache.set(key, b);
+      buf = cache.get(key);
+      if (!buf) {
+        buf = normPeak(synthRiser(e.dur, sr, mulberry32(hashString(key) ^ seed)));
+        cache.set(key, buf);
       }
-      plays.push({ t: e.t, kind: 'riser', buf: b, gain: e.vel });
     } else if (e.kind === 'chord') {
+      // notes of a chord that start together are rendered as one voice
       const group = [e];
       while (i + 1 < evs.length && evs[i + 1].kind === 'chord' && evs[i + 1].t === e.t && evs[i + 1].dur === e.dur) group.push(evs[++i]);
-      const midis = group.map((g) => g.midi).sort((a, b) => a - b);
-      const vel = group.reduce((a, g) => a + g.vel, 0) / group.length;
-      plays.push({ t: e.t, kind: 'chord', buf: voiceBuffer('chord', midis, e.dur, e), gain: vel });
-    } else if (PT[e.kind]) {
-      plays.push({ t: e.t, kind: e.kind, buf: voiceBuffer(e.kind, [e.midi], e.dur, e), gain: e.vel });
-    }
-    if ((i & 63) === 0) await maybeYield(0.05 + 0.45 * (i / evs.length));
+      const midis = group.map((x) => x.midi).sort((a, b) => a - b);
+      g = group.reduce((a, x) => a + x.vel, 0) / group.length;
+      buf = voice('chord', midis, e.dur, e);
+    } else if (PT[e.kind]) buf = voice(e.kind, [e.midi], e.dur, e);
+    if (buf) plays.push({ s0: Math.round(e.t * sr), L: buf[0], R: buf[1], g, kind: e.kind });
+    if ((i & 31) === 0) await maybeYield(0.4 * (i / evs.length));
   }
-  progress(0.5);
-  const tSynth = performance.now();
+  plays.sort((a, b) => a.s0 - b.s0);
+  const tSynth = now();
 
-  // ── 3. mixer graph ──
-  const master = ctx.createGain();
-  master.connect(ctx.destination);
+  // ── 2. JS mixer ──
+  const out = makeAudioBuffer(OAC, 2, N, sr);
+  const oL = out.getChannelData(0);
+  const oR = out.getChannelData(1);
+  const rsr = sr / 2; // reverb runs at half rate
+  const M = Math.ceil(N / 2);
+  const rctx = new OAC(2, M, rsr);
+  const sendBuf = rctx.createBuffer(1, M, rsr);
+  const send = sendBuf.getChannelData(0);
 
-  // reverb
-  const [irL, irR] = makeImpulse(sr, MX.reverb, MX.damp, mulberry32(seed ^ 0x51f15e));
-  const conv = ctx.createConvolver();
-  conv.buffer = toBuffer(irL, irR);
-  const revIn = ctx.createGain();
-  const revHP = ctx.createBiquadFilter();
-  revHP.type = 'highpass';
-  revHP.frequency.value = 220;
-  const revOut = ctx.createGain();
-  revOut.gain.value = 0.9;
-  revIn.connect(revHP).connect(conv).connect(revOut).connect(master);
+  const bus = {};
+  for (const kind of KIND_LIST) {
+    const swept = MX.sweep && SWEPT.has(kind);
+    bus[kind] = {
+      L: new Float32Array(MIX_BLOCK),
+      R: new Float32Array(MIX_BLOCK),
+      active: [],
+      level: MX.level[kind] ?? 0.5,
+      duck: MX.duck[kind] || 0,
+      rev: MX.rev[kind] || 0,
+      dly: MX.dly[kind] || 0,
+      fl: swept ? new SVF(sr) : null,
+      fr: swept ? new SVF(sr) : null,
+      q: kind === 'bass' ? 0.7 : 1.2,
+      open: true, // filter bypassed (fully open)
+    };
+  }
+  const kicks = muted.has('kick') ? [] : comp.events.filter((e) => e.kind === 'kick');
+  const dipper = makeDipper(kicks, sr, bpm);
+  const sweepAt = makeSweep(comp.sections);
+  const dip = new Float32Array(MIX_BLOCK);
+  const revBlock = new Float32Array(MIX_BLOCK);
+  const dlyBlock = new Float32Array(MIX_BLOCK);
 
-  // tempo-synced ping-pong delay
-  const dIn = ctx.createGain();
-  dIn.channelCount = 1;
-  dIn.channelCountMode = 'explicit';
-  const dHP = ctx.createBiquadFilter();
-  dHP.type = 'highpass';
-  dHP.frequency.value = 350;
-  const dTime = Math.min(1.9, (60 / bpm) * MX.delayBeats);
-  const dL = ctx.createDelay(2);
-  const dR = ctx.createDelay(2);
-  dL.delayTime.value = dTime;
-  dR.delayTime.value = dTime;
-  const dTone = ctx.createBiquadFilter();
-  dTone.type = 'lowpass';
-  dTone.frequency.value = 3400;
-  const dFb = ctx.createGain();
-  dFb.gain.value = MX.feedback;
-  const pL = ctx.createStereoPanner();
-  pL.pan.value = -0.85;
-  const pR = ctx.createStereoPanner();
-  pR.pan.value = 0.85;
-  const dOut = ctx.createGain();
-  dOut.gain.value = 0.8;
-  dIn.connect(dHP).connect(dL);
-  dL.connect(dR);
-  dR.connect(dTone).connect(dFb).connect(dL);
-  dL.connect(pL).connect(dOut);
-  dR.connect(pR).connect(dOut);
-  dOut.connect(master);
-  dOut.connect(revIn);
+  // ping-pong delay state
+  const D = Math.max(1, Math.round(Math.min(1.9, (60 / bpm) * MX.delayBeats) * sr));
+  const dBufL = new Float32Array(D);
+  const dBufR = new Float32Array(D);
+  let dIdx = 0, hpX = 0, hpY = 0, fbLp = 0;
+  const hpA = Math.exp((-TWO_PI * 350) / sr);
+  const lpA = 1 - Math.exp((-TWO_PI * 3400) / sr);
+  const fb = MX.feedback;
+  const DLY_OUT = 0.8;
+  const DLY_REV = 0.25;
+  let x1 = 0, x2 = 0; // decimator history
 
-  // sidechain-style ducking from the kick events (gain automation)
-  const kicks = comp.events.filter((e) => e.kind === 'kick' && !muted.has('kick'));
-  const duckRel = Math.min(0.12, (60 / bpm) * 0.2);
-  const makeDuck = (depth) => {
-    const g = ctx.createGain();
-    if (depth > 0) {
-      for (const k of kicks) {
-        const d = depth * clamp(k.vel / 0.9, 0.4, 1);
-        g.gain.setTargetAtTime(1 - d, k.t, 0.003);
-        g.gain.setTargetAtTime(1, k.t + 0.02, duckRel);
+  let pi = 0;
+  for (let b0 = 0; b0 < N; b0 += MIX_BLOCK) {
+    const len = Math.min(MIX_BLOCK, N - b0);
+    const b1 = b0 + len;
+    while (pi < plays.length && plays[pi].s0 < b1) {
+      bus[plays[pi].kind].active.push(plays[pi]);
+      pi++;
+    }
+    dipper(dip, b0, len);
+    revBlock.fill(0);
+    dlyBlock.fill(0);
+    const fc = sweepAt((b0 + len / 2) / sr);
+
+    for (let k = 0; k < KIND_LIST.length; k++) {
+      const s = bus[KIND_LIST[k]];
+      if (!s.active.length) {
+        s.open = true;
+        continue;
+      }
+      const L = s.L, R = s.R;
+      L.fill(0);
+      R.fill(0);
+      let keep = 0;
+      for (let a = 0; a < s.active.length; a++) {
+        const p = s.active[a];
+        const end = p.s0 + p.L.length;
+        const from = p.s0 > b0 ? p.s0 : b0;
+        const to = end < b1 ? end : b1;
+        const pl = p.L, pr = p.R, g = p.g, off = p.s0;
+        for (let i = from; i < to; i++) {
+          L[i - b0] += pl[i - off] * g;
+          R[i - b0] += pr[i - off] * g;
+        }
+        if (end > b1) s.active[keep++] = p;
+      }
+      s.active.length = keep;
+
+      if (s.fl) {
+        if (fc < 18000) {
+          if (s.open) {
+            s.fl.ic1 = s.fl.ic2 = s.fr.ic1 = s.fr.ic2 = 0;
+            s.open = false;
+          }
+          s.fl.set(fc, s.q);
+          s.fr.set(fc, s.q);
+          for (let i = 0; i < len; i++) {
+            L[i] = s.fl.lp(L[i]);
+            R[i] = s.fr.lp(R[i]);
+          }
+        } else s.open = true;
+      }
+
+      const lvl = s.level, depth = s.duck, rv = s.rev, dl = s.dly;
+      for (let i = 0; i < len; i++) {
+        const g = (depth ? 1 - depth * dip[i] : 1) * lvl;
+        const l = L[i] * g, r = R[i] * g;
+        oL[b0 + i] += l;
+        oR[b0 + i] += r;
+        if (rv) revBlock[i] += (l + r) * 0.5 * rv;
+        if (dl) dlyBlock[i] += (l + r) * 0.5 * dl;
       }
     }
-    return g;
-  };
-  if (MX.duck.rev > 0) {
-    // re-route reverb return through a ducker: pumping tails are part of the genre
-    revOut.disconnect();
-    revOut.connect(makeDuck(MX.duck.rev)).connect(master);
-  }
 
-  // section-driven low-pass "filter sweep" automation (intro / builds / breaks / outro)
-  const automateSweep = (param) => {
-    let cur = 20000;
-    param.setValueAtTime(20000, 0);
-    for (const s of comp.sections) {
-      const a = s.start;
-      const b = Math.max(a + 0.01, s.end - 0.005);
-      if (s.name === 'intro') {
-        param.setValueAtTime(500, a);
-        param.exponentialRampToValueAtTime(3200, b);
-        cur = 3200;
-      } else if (s.name === 'build') {
-        param.setValueAtTime(cur, a);
-        param.exponentialRampToValueAtTime(19000, b);
-        cur = 19000;
-      } else if (s.name === 'drop') {
-        param.setValueAtTime(20000, a);
-        cur = 20000;
-      } else if (s.name === 'break') {
-        param.setValueAtTime(900, a);
-        param.exponentialRampToValueAtTime(4000, b);
-        cur = 4000;
-      } else if (s.name === 'outro') {
-        param.setValueAtTime(20000, a);
-        param.exponentialRampToValueAtTime(1100, b);
-        cur = 1100;
+    // ping-pong delay: left line → right line → (filtered feedback) → left line
+    for (let i = 0; i < len; i++) {
+      const x = dlyBlock[i];
+      hpY = hpA * (hpY + x - hpX);
+      hpX = x;
+      const eL = dBufL[dIdx], eR = dBufR[dIdx];
+      fbLp += lpA * (eR - fbLp);
+      dBufL[dIdx] = hpY + fb * fbLp;
+      dBufR[dIdx] = eL;
+      if (++dIdx >= D) dIdx = 0;
+      oL[b0 + i] += (eL * 0.9 + eR * 0.1) * DLY_OUT;
+      oR[b0 + i] += (eR * 0.9 + eL * 0.1) * DLY_OUT;
+      revBlock[i] += (eL + eR) * 0.5 * DLY_REV;
+    }
+
+    // 2:1 decimation of the reverb send ([1 2 1] / 4 kernel)
+    for (let i = 0; i < len; i++) {
+      const gi = b0 + i;
+      const x = revBlock[i];
+      if (gi & 1) send[gi >> 1] = 0.25 * x2 + 0.5 * x1 + 0.25 * x;
+      x2 = x1;
+      x1 = x;
+    }
+    if ((b0 & 0xffff) === 0) await maybeYield(0.4 + 0.3 * (b0 / N));
+  }
+  const tMix = now();
+
+  // ── 3. convolution reverb (OfflineAudioContext) ──
+  const [irL, irR] = makeImpulse(rsr, MX.reverb, MX.damp, mulberry32(seed ^ 0x51f15e));
+  const ir = rctx.createBuffer(2, irL.length, rsr);
+  ir.copyToChannel(irL, 0);
+  ir.copyToChannel(irR, 1);
+  const src = rctx.createBufferSource();
+  src.buffer = sendBuf;
+  const hp = rctx.createBiquadFilter();
+  hp.type = 'highpass';
+  hp.frequency.value = 220;
+  const conv = rctx.createConvolver();
+  conv.buffer = ir;
+  src.connect(hp).connect(conv).connect(rctx.destination);
+  src.start(0);
+  progress(0.72);
+  const wet = await rctx.startRendering();
+  const tRev = now();
+
+  // ── 4. reverb return (ducked, linear-interpolated back to full rate) + master ──
+  {
+    const wL = wet.getChannelData(0);
+    const wR = wet.getChannelData(1);
+    const dip2 = makeDipper(kicks, sr, bpm);
+    const depth = MX.duck.rev || 0;
+    const RET = 0.9;
+    for (let b0 = 0; b0 < N; b0 += MIX_BLOCK) {
+      const len = Math.min(MIX_BLOCK, N - b0);
+      dip2(dip, b0, len);
+      for (let i = 0; i < len; i++) {
+        const gi = b0 + i;
+        const j = gi >> 1;
+        const g = RET * (1 - depth * dip[i]);
+        let l = wL[j], r = wR[j];
+        if (gi & 1 && j + 1 < M) {
+          l = 0.5 * (l + wL[j + 1]);
+          r = 0.5 * (r + wR[j + 1]);
+        }
+        oL[gi] += l * g;
+        oR[gi] += r * g;
       }
     }
-  };
-
-  const buses = {};
-  const KINDS_ALL = ['kick', 'snare', 'clap', 'hat', 'openhat', 'bass', 'lead', 'arp', 'chord', 'riser', 'impact'];
-  for (const kind of KINDS_ALL) {
-    const input = ctx.createGain();
-    input.gain.value = MX.level[kind] ?? 0.5;
-    let node = input;
-    const depth = MX.duck[kind] || 0;
-    if (depth > 0) node = node.connect(makeDuck(depth));
-    if (MX.sweep && (kind === 'bass' || kind === 'lead' || kind === 'arp' || kind === 'chord')) {
-      const f = ctx.createBiquadFilter();
-      f.type = 'lowpass';
-      f.Q.value = kind === 'bass' ? 0.7 : 1.2;
-      automateSweep(f.frequency);
-      node = node.connect(f);
-    }
-    node.connect(master);
-    if (MX.rev[kind]) {
-      const s = ctx.createGain();
-      s.gain.value = MX.rev[kind];
-      node.connect(s).connect(revIn);
-    }
-    if (MX.dly[kind]) {
-      const s = ctx.createGain();
-      s.gain.value = MX.dly[kind];
-      node.connect(s).connect(dIn);
-    }
-    buses[kind] = input;
   }
-
-  // ── 4. schedule ──
-  for (let i = 0; i < plays.length; i++) {
-    const p = plays[i];
-    const src = ctx.createBufferSource();
-    src.buffer = p.buf;
-    const g = ctx.createGain();
-    g.gain.value = p.gain;
-    src.connect(g).connect(buses[p.kind]);
-    src.start(p.t);
-  }
-  progress(0.55);
-
-  const tGraph = performance.now();
-  const out = await ctx.startRendering();
-  progress(0.9);
-  const tRender = performance.now();
-
-  // ── 5. master bus (JS, zero latency) ──
+  progress(0.85);
+  await yieldToUI();
   if (doMaster) masterBus(out, comp, sr);
   if (stats) {
     Object.assign(stats, {
       synthMs: Math.round(tSynth - tStart),
-      graphMs: Math.round(tGraph - tSynth),
-      renderMs: Math.round(tRender - tGraph),
-      masterMs: Math.round(performance.now() - tRender),
+      mixMs: Math.round(tMix - tSynth),
+      reverbMs: Math.round(tRev - tMix),
+      masterMs: Math.round(now() - tRev),
+      totalMs: Math.round(now() - tStart),
       voices: cache.size,
-      sources: plays.length,
+      plays: plays.length,
     });
   }
   progress(1);

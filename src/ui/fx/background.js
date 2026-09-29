@@ -19,6 +19,7 @@ const NOTE_SIZE = 0.875;    // note side (grid units), same as the game
 const GRID_HALF = 1.5;      // the 3×3 grid spans −1.5 … 1.5 (cell centres at −1, 0, 1)
 const FRAME_HALF = 1.62;
 const FRAME_GAP = 2.4;      // spacing of tunnel frames
+const TRAVEL_Z = 38;        // notes appear this far behind the grid
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
@@ -269,7 +270,7 @@ export class NeonBackdrop {
     if (!this.o.notes) return;
     const spb = 60 / (this.o.bpm || 120);
     const half = spb / 2;
-    const travel = 26 / this._speed();
+    const travel = TRAVEL_Z / this._speed();
     if (this.slot == null) this.slot = Math.ceil((song + 0.2) / half);
     const dens = clamp(this.o.density * (0.55 + 0.45 * this.o.intensity), 0.1, 1.5);
     while (this.slot * half <= song + travel) {
@@ -493,7 +494,7 @@ export class NeonBackdrop {
 
     // ---- notes
     this._schedule(song);
-    const travelZ = 26;
+    const travelZ = TRAVEL_Z;
     for (let i = this.notes.length - 1; i >= 0; i--) {
       const n = this.notes[i];
       if (!n.hit && n.ta <= song) {
@@ -607,7 +608,7 @@ export class NeonBackdrop {
         }
       }
       const spr = dotSprite('#ffffff');
-      const r = s * 0.34;
+      const r = s * 0.2;
       ctx.drawImage(spr.canvas, px - r, py - r, r * 2, r * 2);
       // tiny flapping wings — it's a fly after all
       const flap = Math.sin(this.time * 55) * 0.4;

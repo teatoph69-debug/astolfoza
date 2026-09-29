@@ -61,17 +61,17 @@
 .menu-top-btn:hover { border-color: var(--border-strong); color: var(--text); background: rgba(40, 30, 76, 0.7); }
 .menu-eq { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; width: 17px; }
 .menu-eq i { flex: 1; height: 30%; border-radius: 2px; background: var(--cyan); box-shadow: 0 0 6px rgba(67, 232, 255, 0.6); }
-.menu-music.idle .menu-eq i { background: var(--text-faint); box-shadow: none; }
-.menu-music.on { color: var(--text); border-color: rgba(67, 232, 255, 0.35); }
-.menu-music.on .menu-eq i { animation: menu-eq 0.8s ease-in-out infinite alternate; }
-.menu-music.on .menu-eq i:nth-child(2) { animation-duration: 0.55s; animation-delay: -0.2s; }
-.menu-music.on .menu-eq i:nth-child(3) { animation-duration: 0.7s; animation-delay: -0.4s; }
-.menu-music.on .menu-eq i:nth-child(4) { animation-duration: 0.45s; animation-delay: -0.1s; }
-.menu-music.loading .menu-eq i { animation: menu-eq-load 0.9s ease-in-out infinite; opacity: 0.7; }
-.menu-music.loading .menu-eq i:nth-child(2) { animation-delay: 0.12s; }
-.menu-music.loading .menu-eq i:nth-child(3) { animation-delay: 0.24s; }
-.menu-music.loading .menu-eq i:nth-child(4) { animation-delay: 0.36s; }
-.menu-music.off .ico { width: 17px; height: 17px; }
+.menu-music.is-idle .menu-eq i { background: var(--text-faint); box-shadow: none; }
+.menu-music.is-on { color: var(--text); border-color: rgba(67, 232, 255, 0.35); }
+.menu-music.is-on .menu-eq i { animation: menu-eq 0.8s ease-in-out infinite alternate; }
+.menu-music.is-on .menu-eq i:nth-child(2) { animation-duration: 0.55s; animation-delay: -0.2s; }
+.menu-music.is-on .menu-eq i:nth-child(3) { animation-duration: 0.7s; animation-delay: -0.4s; }
+.menu-music.is-on .menu-eq i:nth-child(4) { animation-duration: 0.45s; animation-delay: -0.1s; }
+.menu-music.is-loading .menu-eq i { animation: menu-eq-load 0.9s ease-in-out infinite; opacity: 0.7; }
+.menu-music.is-loading .menu-eq i:nth-child(2) { animation-delay: 0.12s; }
+.menu-music.is-loading .menu-eq i:nth-child(3) { animation-delay: 0.24s; }
+.menu-music.is-loading .menu-eq i:nth-child(4) { animation-delay: 0.36s; }
+.menu-music.is-off .ico { width: 17px; height: 17px; }
 @keyframes menu-eq { from { height: 20%; } to { height: 100%; } }
 @keyframes menu-eq-load { 0%, 100% { height: 25%; } 50% { height: 80%; } }
 
@@ -135,7 +135,7 @@
 .menu-logo-x { color: var(--pink); letter-spacing: 0; text-shadow: 0 0 16px rgba(255, 61, 154, 0.8); font-size: 1.25em; line-height: 1; }
 .menu-logo-rhythia { color: transparent; -webkit-text-stroke: 1.2px rgba(67, 232, 255, 0.95); text-shadow: 0 0 22px rgba(67, 232, 255, 0.35); margin-right: -0.55em; }
 .menu-logo-line { flex: 1; max-width: 170px; height: 1px; margin-left: 0.6em; background: linear-gradient(90deg, rgba(67, 232, 255, 0.8), transparent); }
-.menu-tagline { margin: 16px 0 0; font-size: clamp(15px, 1.35vw, 18px); color: var(--text-dim); min-height: 1.45em; }
+.menu-tagline { text-shadow: 0 1px 12px #07060d, 0 0 3px #07060d; margin: 16px 0 0; font-size: clamp(15px, 1.35vw, 18px); color: var(--text-dim); min-height: 1.45em; }
 .menu-caret {
   display: inline-block; width: 9px; height: 1.05em; vertical-align: -0.16em; margin-left: 4px;
   background: var(--cyan); box-shadow: 0 0 12px rgba(67, 232, 255, 0.8);
@@ -412,6 +412,7 @@
   .menu-minor-btn { flex-direction: column; gap: 5px; padding: 10px 6px; font-size: 12px; }
   .menu-minor-btn .ico { width: 19px; height: 19px; }
   .menu-foot-right { display: none; }
+  .menu-item-key { display: none; }
   .menu-imp-grid { grid-template-columns: minmax(0, 1fr); }
   .menu-help-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
 }
