@@ -103,7 +103,7 @@ export function computeStars(notes, settings = DEFAULT_SETTINGS) {
   const raw = peak * lengthBonus;
   const lin = Math.max(0, STAR_SCALE * Math.pow(raw, STAR_POW) - STAR_OFFSET);
   // compress the very top so stars ≈ the curriculum level the AI is benchmarked on
-  return lin < 11 ? lin : 11 + (lin - 11) * 0.72;
+  return lin;
 }
 
 // Calibrated so that the procedural curriculum level L produces ≈ L stars (fit on syntheticMap levels 0…12).

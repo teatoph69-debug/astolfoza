@@ -1,0 +1,50 @@
+{
+  "name": "muxa98",
+  "productName": "MUXA98",
+  "version": "1.0.0",
+  "description": "МУХА 98 — Rhythia-style aim rhythm game with a neural network that learns to play it",
+  "main": "main.cjs",
+  "author": "МУХА 98",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "prepare-app": "node ../tools/build.mjs && node copy-app.cjs",
+    "start": "npm run prepare-app && electron .",
+    "dist:win": "npm run prepare-app && electron-builder --win nsis portable --x64 --publish never",
+    "dist:linux": "npm run prepare-app && electron-builder --linux AppImage --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "25.1.8"
+  },
+  "build": {
+    "appId": "com.muxa98.rhythia",
+    "productName": "MUXA98",
+    "copyright": "МУХА 98",
+    "files": ["main.cjs", "preload.cjs", "app/**/*"],
+    "directories": { "output": "release", "buildResources": "build" },
+    "artifactName": "MUXA98-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "icon": "build/icon.png",
+      "target": ["nsis", "portable"]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "МУХА 98",
+      "artifactName": "MUXA98-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "MUXA98-Portable-${version}.${ext}"
+    },
+    "linux": {
+      "icon": "build/icon-512.png",
+      "target": ["AppImage"],
+      "category": "Game",
+      "artifactName": "MUXA98-${version}.${ext}"
+    }
+  }
+}

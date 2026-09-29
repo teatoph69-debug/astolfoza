@@ -157,6 +157,36 @@ export class AudioEngine {
     this._sfx.miss = make(0.16, (t) => Math.sin(2 * Math.PI * (140 - t * 400) * t) * Math.exp(-t * 22) * 0.7);
     // UI click
     this._sfx.ui = make(0.04, (t) => Math.sin(2 * Math.PI * 1200 * t) * Math.exp(-t * 120) * 0.4);
+    // Win98-style system sounds (original synth, not the Microsoft samples)
+    this._sfx.ding = make(0.7, (t) => {
+      const e = Math.exp(-t * 6);
+      return (Math.sin(2 * Math.PI * 1318.5 * t) * 0.35 + Math.sin(2 * Math.PI * 2637 * t) * 0.12 + Math.sin(2 * Math.PI * 1975.5 * t) * 0.1) * e * Math.min(1, t * 400);
+    });
+    this._sfx.chord = make(0.9, (t) => {
+      const e = Math.exp(-t * 4.5) * Math.min(1, t * 300);
+      let s = 0;
+      for (const f of [196, 246.9, 293.7, 392]) s += Math.sin(2 * Math.PI * f * t) + 0.3 * Math.sin(4 * Math.PI * f * t);
+      return s * 0.09 * e;
+    });
+    // startup chime: a slow, shimmering major-7 bloom with a bell arpeggio on top
+    this._sfx.startup = make(4.2, (t) => {
+      let s = 0;
+      const pad = [130.8, 196, 246.9, 329.6, 493.9];
+      const env = Math.min(1, t / 0.9) * Math.exp(-Math.max(0, t - 1.6) * 1.3);
+      for (let k = 0; k < pad.length; k++) {
+        const f = pad[k] * (1 + 0.002 * Math.sin(t * (1.3 + k)));
+        s += (Math.sin(2 * Math.PI * f * t) + 0.25 * Math.sin(2 * Math.PI * f * 2.003 * t)) * 0.07;
+      }
+      s *= env;
+      const bells = [523.3, 659.3, 784, 987.8, 1318.5];
+      for (let k = 0; k < bells.length; k++) {
+        const st = 0.35 + k * 0.22;
+        if (t < st) continue;
+        const u = t - st;
+        s += Math.sin(2 * Math.PI * bells[k] * u) * Math.exp(-u * 2.2) * 0.13 + Math.sin(2 * Math.PI * bells[k] * 3.01 * u) * Math.exp(-u * 6) * 0.03;
+      }
+      return s;
+    });
     // level-up chime (arpeggio)
     this._sfx.levelup = make(0.9, (t) => {
       const notes = [0, 4, 7, 12];

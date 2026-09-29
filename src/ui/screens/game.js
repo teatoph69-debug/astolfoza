@@ -9,6 +9,8 @@ import { DEFAULT_SETTINGS, gradeFor } from '../../core/constants.js';
 import { packNotes, formatTime } from '../../core/map.js';
 import { AIDriver } from '../../ai/driver.js';
 import { titleFor } from '../../ai/trainer.js';
+import { icon } from '../icons.js';
+import { win98Window } from '../win98.js';
 
 const SENS_BASE = 0.009;          // grid units per mouse pixel at sensitivity 1 (SS+: px × 0.018 × 0.5)
 const PLAYER_COLOR = '#ffffff';
@@ -83,6 +85,7 @@ export class GameScreen extends Screen {
     this.endTime = this.lastNote + 1.2;
     this.startAt = Math.min(0, this.firstNote - LEAD_IN);
     this._setupHud();
+    this.setTitle(`rhythia.exe — ${map.artist ? map.artist + ' — ' : ''}${map.title} [${map.difficultyName || '?'}]${this.mode === 'watch' ? tr(' · смотрим МУХУ', ' · watching МУХА') : this.mode === 'versus' ? tr(' · против МУХИ', ' · vs МУХА') : ''}`);
     this.resize();
 
     // load audio, then wait for click (pointer lock needs a gesture) or start right away
@@ -124,13 +127,21 @@ export class GameScreen extends Screen {
   // --------------------------------------------------------------------------------------------
   _showClickToStart() {
     clear(this.overlay);
-    const box = h('div.game-start',
-      h('div.game-start-title', this.map.title),
-      h('div.game-start-sub', `${this.map.difficultyName || ''} · ★${(this.map.stars || 0).toFixed(2)}`),
-      h('div.game-start-cta', tr('Кликни, чтобы начать', 'Click to start')),
-      h('div.game-start-hint', this.mode === 'versus'
-        ? tr('Ты против МУХИ. Курсор захватывается — Esc для паузы.', "You vs МУХА. The cursor gets locked — Esc to pause.")
-        : tr('Курсор захватывается как в Rhythia — Esc для паузы, R — рестарт.', 'The cursor is locked like in Rhythia — Esc to pause, R to restart.')));
+    const w = win98Window({
+      title: this.mode === 'versus' ? tr('Против МУХИ', 'Versus МУХА') : 'rhythia.exe',
+      iconName: this.mode === 'versus' ? 'versus' : 'play',
+      controls: [],
+      className: 'game-start',
+      body: h('div.game-start-body',
+        h('div.game-start-head', icon('play', 32), h('div',
+          h('div.game-start-title.display', this.map.title),
+          h('div.game-start-sub', `${this.map.artist || ''} · ${this.map.difficultyName || ''} · ★${(this.map.stars || 0).toFixed(2)}`))),
+        h('div.game-start-cta', tr('Кликни по полю, чтобы начать', 'Click the field to start')),
+        h('div.game-start-hint', this.mode === 'versus'
+          ? tr('Ты против МУХИ. Курсор захватывается — Esc для паузы.', 'You vs МУХА. The cursor gets locked — Esc to pause.')
+          : tr('Курсор захватывается как в Rhythia · Esc — пауза · R — рестарт', 'The cursor is locked like in Rhythia · Esc — pause · R — restart'))),
+    });
+    const box = w.root;
     this.overlay.append(box);
     this._awaitingClick = true;
   }
@@ -220,12 +231,18 @@ export class GameScreen extends Screen {
     this.pausedAt = this.app.audio.pause();
     if (document.pointerLockElement) document.exitPointerLock?.();
     clear(this.overlay);
-    const btn = (label, fn, cls = '') => h(`button.btn.btn-lg${cls}`, { onclick: (e) => { e.stopPropagation(); this.app.audio.sfx('ui'); fn(); } }, label);
-    this.overlay.append(h('div.game-pause',
-      h('div.game-pause-title', tr('Пауза', 'Paused')),
-      btn(tr('Продолжить', 'Resume'), () => this.resume(), '.btn-primary'),
-      btn(tr('Заново', 'Restart'), () => this.restart()),
-      btn(tr('Выйти', 'Quit'), () => this.app.go('select', { mode: this.mode, focusSet: this.map.setId }, { replace: true }))));
+    const btn = (label, fn, primary = false) => h(`button.btn98${primary ? '.default' : ''}`, { onclick: (e) => { e.stopPropagation(); this.app.audio.sfx('ui'); fn(); } }, label);
+    const w = win98Window({
+      title: tr('Пауза', 'Paused'), iconName: 'play', controls: ['close'], className: 'game-pause',
+      onControl: () => this.resume(),
+      body: h('div.game-pause-body',
+        h('div.game-pause-info', icon('info', 32), h('div', h('b', this.map.title), h('div', tr('Игра на паузе. Что делаем?', 'The game is paused. What next?')))),
+        h('div.game-pause-buttons',
+          btn(tr('Продолжить', 'Resume'), () => this.resume(), true),
+          btn(tr('Заново', 'Restart'), () => this.restart()),
+          btn(tr('Выйти', 'Quit'), () => this.app.go('select', { mode: this.mode, focusSet: this.map.setId }, { replace: true })))),
+    });
+    this.overlay.append(w.root);
   }
 
   resume() {
@@ -517,7 +534,7 @@ function buildHud() {
       h('div.hud-label', tr('НОТЫ', 'NOTES')), hits,
       h('div.hud-label', tr('ПРОМАХИ', 'MISSES')), miss),
     h('div.hud-bottom', healthWrap),
-    h('div.hud-ai', aiName, aiRank, h('div.hud-ai-stats', aiAcc, aiScore, aiCombo, aiSpeed)),
+    h('div.hud-ai.win', h('div.win-title', icon('fly', 16, 'win-title-icon'), h('div.win-title-text', 'МУХА.exe')), h('div.hud-ai-body', aiName, aiRank, h('div.hud-ai-stats', aiAcc, aiScore, aiCombo, aiSpeed))),
     tug,
     fps);
   return { root, title, diff, time, progress, acc, grade, combo, mult, multRing, score, hits, miss, health, healthWrap, fps, aiName, aiRank, aiAcc, aiScore, aiCombo, aiSpeed, tug };

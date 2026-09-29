@@ -40,6 +40,12 @@ const sessionOpts = {
 let session;
 if (args.resume && fs.existsSync(out)) {
   session = TrainingSession.deserialize(JSON.parse(fs.readFileSync(out, 'utf8')), sessionOpts);
+  if (args.rebench) {
+    // the benchmark / curriculum changed: forget old scores so the champion is re-selected fairly
+    session.bestSkill = -1;
+    session.curriculum.level = Math.min(session.curriculum.level, +(args.rebench === true ? 10 : args.rebench));
+    session.curriculum.ema = 0;
+  }
   console.log(`resumed gen ${session.gen} level ${session.curriculum.level} skill ${session.skill.toFixed(2)}`);
 } else {
   session = new TrainingSession(sessionOpts);

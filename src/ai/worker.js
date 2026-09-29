@@ -5,6 +5,8 @@
 //   { type: 'map', key, packed }                           → (no reply) register a custom training map
 //   { type: 'clearMaps' }                                  → (no reply)
 //   { type: 'bench', id, arch, params, hand, levels }      → { id, perLevel: [{level, acc, hits, n}] }
+//   { type: 'benchRuns', id, arch, params, hand, runs }    → { id, hits: Int32Array, n: Int32Array }
+//   { type: 'units', id, arch, candidates, c0, episodes, u0, u1, hand } → { id, fit: Float64Array, hits: Int32Array }
 //   { id, arch, candidates, episodes, hand }               → { id, fitness: Float64Array, acc: Float64Array }
 //
 // `candidates` is an array of Float32Array views; the pool packs them into ONE ArrayBuffer and
@@ -53,6 +55,42 @@ export function benchLevels(arch, params, hand, levels = BENCH_LEVELS) {
   return out;
 }
 
+/**
+ * Evaluate a contiguous range of work units. Unit u = (candidate ⌊u/E⌋, episode u mod E), so the
+ * pool can split a generation evenly across any number of workers (24 workers, 49 candidates).
+ * `candidates[k]` holds candidate c0 + k. Returns per-unit raw episode fitness and hits; the pool
+ * sums them in the same order as evaluateCandidates, so the result is bit-identical.
+ */
+export function evaluateUnits(arch, candidates, c0, episodes, u0, u1, hand) {
+  const net = netFor(arch);
+  const E = episodes.length;
+  const charts = new Array(E);
+  const fit = new Float64Array(u1 - u0);
+  const hits = new Int32Array(u1 - u0);
+  for (let u = u0; u < u1; u++) {
+    const ci = Math.floor(u / E), e = u - ci * E;
+    const chart = charts[e] || (charts[e] = episodeNotes(episodes[e]));
+    if (!chart.n) continue;
+    const r = runEpisode(net, chart, { params: candidates[ci - c0], hand });
+    fit[u - u0] = r.fitness;
+    hits[u - u0] = r.hits;
+  }
+  return { fit, hits };
+}
+
+/** Benchmark runs [[level, k], …] → per-run hits / note counts. */
+export function benchRuns(arch, params, hand, runs) {
+  const net = netFor(arch);
+  const hits = new Int32Array(runs.length);
+  const n = new Int32Array(runs.length);
+  runs.forEach(([level, k], i) => {
+    const r = runEpisode(net, episodeNotes(benchEpisode(level, k)), { params, hand });
+    hits[i] = r.hits;
+    n[i] = r.n;
+  });
+  return { hits, n };
+}
+
 // ---- message handler ---------------------------------------------------------------------------
 
 /**
@@ -69,6 +107,15 @@ export function handleMessage(msg) {
     case 'clearMaps':
       clearTrainingMaps();
       return null;
+    case 'units': {
+      const { id, arch, candidates, c0, episodes, u0, u1, hand } = msg;
+      const { fit, hits } = evaluateUnits(arch, candidates.map(toF32), c0, episodes, u0, u1, hand);
+      return { reply: { id, fit, hits }, transfer: [fit.buffer, hits.buffer] };
+    }
+    case 'benchRuns': {
+      const { hits, n } = benchRuns(msg.arch, toF32(msg.params), msg.hand, msg.runs);
+      return { reply: { id: msg.id, hits, n }, transfer: [hits.buffer, n.buffer] };
+    }
     case 'bench': {
       const perLevel = benchLevels(msg.arch, toF32(msg.params), msg.hand, msg.levels || BENCH_LEVELS);
       return { reply: { id: msg.id, perLevel }, transfer: [] };

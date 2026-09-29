@@ -1,0 +1,86 @@
+/* ==========================================================================
+   «Результаты» (results) — dialog-like layout
+   ========================================================================== */
+
+.screen-results { background: var(--face); }
+.res-root { position: absolute; inset: 0; overflow-y: auto; padding: 8px 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.res-root > * { width: 100%; max-width: 1100px; margin-left: auto; margin-right: auto; }
+
+.res-top { display: flex; align-items: center; gap: 10px; padding-bottom: 6px; box-shadow: inset 0 -1px var(--shadow), 0 1px var(--hilight); }
+.res-top-text { min-width: 0; }
+.res-top-title { font-weight: 700; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.res-top-sub { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+
+.res-body { display: flex; flex-direction: column; gap: 4px; }
+.res-grid { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 10px; align-items: start; }
+.res-grid.vs { grid-template-columns: minmax(0, 360px) minmax(0, 1fr); }
+.res-col { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.res-body .groupbox { margin-top: 10px; min-width: 0; }
+
+/* grade */
+.res-grade-box { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.res-grade { display: grid; place-items: center; overflow: hidden; }
+.res-grade.big { width: 170px; height: 150px; }
+.res-grade.mid { width: 100%; height: 96px; }
+.res-grade-letter {
+  font-size: 118px; line-height: 1; color: var(--title-a); text-shadow: 4px 4px 0 var(--g);
+  animation: res-slam 0.36s steps(4) both;
+}
+.res-grade.mid .res-grade-letter { font-size: 72px; text-shadow: 3px 3px 0 var(--g); }
+.res-grade.g-F .res-grade-letter { color: var(--bad); text-shadow: 4px 4px 0 #400000; }
+.res-grade.g-SS .res-grade-letter, .res-grade.g-S .res-grade-letter { text-shadow: 4px 4px 0 var(--g), 5px 5px 0 #806000; }
+@keyframes res-slam { from { transform: scale(2.2); opacity: 0; } to { transform: none; opacity: 1; } }
+.res-badges { display: flex; gap: 4px; flex-wrap: wrap; justify-content: center; min-height: 18px; }
+.res-badges .chip { font-weight: 700; }
+.res-chip-fc { background: #ffff00; }
+.res-chip-fail { background: var(--bad); color: #fff; }
+.res-chip-rec { background: var(--select); color: var(--select-text); box-shadow: none; animation: res-blink 0.9s steps(2) 3; }
+.res-chip-rec img { width: 16px; height: 16px; }
+@keyframes res-blink { 50% { background: var(--face); color: var(--text); } }
+
+/* score */
+.res-who { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
+.res-score { font-size: 44px; line-height: 1.05; color: var(--title-a); }
+.res-score.mid { font-size: 26px; text-align: center; margin-top: 6px; }
+.res-acc { display: flex; align-items: baseline; gap: 2px; margin-top: 2px; }
+.res-acc .display { font-size: 22px; }
+.res-best { margin-top: 6px; color: var(--text-dim); }
+.res-best b { color: var(--good); }
+.res-table { width: 100%; border-collapse: collapse; }
+.res-table th { text-align: left; font-weight: 400; color: var(--text-dim); padding: 2px 8px 2px 0; width: 42%; }
+.res-table td { padding: 2px 0; font-variant-numeric: tabular-nums; }
+
+/* versus */
+.res-vs-grades { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.res-vs-grades .groupbox { display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
+.res-banner { display: flex; align-items: center; gap: 10px; padding: 8px 10px; margin-bottom: 8px; }
+.res-banner-title { font-size: 24px; line-height: 1.1; color: var(--title-a); }
+.res-banner.w-ai .res-banner-title { color: var(--bad); }
+.res-vs-table { max-height: none; }
+.res-vs-table td, .res-vs-table th { font-variant-numeric: tabular-nums; }
+.res-vs-table th.res-win { font-weight: 700; }
+
+/* charts */
+.res-charts { display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 10px; align-items: start; }
+.res-tl-box, .res-hm-box { position: relative; padding: 0; }
+.res-tl-box { height: 190px; }
+.res-hm-box { height: 230px; }
+.res-canvas { position: absolute; left: 2px; top: 2px; width: calc(100% - 4px); height: calc(100% - 4px); display: block; }
+.res-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; font-size: 11px; }
+.res-legend span { display: inline-flex; align-items: center; gap: 4px; }
+.res-legend i { width: 10px; height: 10px; box-shadow: inset 0 0 0 1px #000; }
+.res-aim-line { margin-top: 6px; font-size: 11px; line-height: 1.35; }
+
+.res-buttons { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; padding-top: 8px; }
+.res-empty { padding: 30px; text-align: center; }
+
+@media (max-width: 760px) {
+  .res-root { padding: 6px 6px 10px; }
+  .res-grid, .res-grid.vs { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .res-grade-box { flex-direction: row; justify-content: center; }
+  .res-grade.big { width: 130px; height: 120px; }
+  .res-grade-letter { font-size: 92px; }
+  .res-score { font-size: 34px; }
+  .res-charts { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .res-buttons .btn98 { flex: 1 1 100%; }
+}

@@ -1,0 +1,176 @@
+/* МУХА 98 shell: desktop, windows, taskbar, Start menu, dialogs, balloons, boot. */
+
+.os { position: fixed; inset: 0; display: grid; grid-template-rows: 1fr auto; }
+.desktop { position: relative; overflow: hidden; background: var(--desktop); }
+.stage { position: absolute; inset: 0; }
+
+/* wallpaper: centered МУХА logo, like a Win98 centered bitmap */
+.wallpaper { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 4px; pointer-events: none; }
+.wallpaper-fly { width: 128px; height: 128px; filter: drop-shadow(4px 4px 0 rgba(0, 0, 0, 0.25)); }
+.wallpaper-text { font-family: var(--font-display); font-weight: 700; font-size: 52px; color: #fff; letter-spacing: 0.04em; line-height: 1; text-shadow: 3px 3px 0 #004848; }
+.wallpaper-text span { font-size: 24px; vertical-align: super; color: #ffe600; margin-left: 4px; text-shadow: 2px 2px 0 #804000; }
+
+/* screens */
+.screen { position: absolute; inset: 0; overflow: hidden; }
+.app-window { position: absolute; }
+.app-window.maximized { box-shadow: none; padding: 0; }
+.app-window > .win-body { margin: 0; position: relative; overflow: hidden; }
+.app-window.maximized > .win-title { height: 20px; }
+.app-window .screen { position: absolute; inset: 0; }
+.app-window.opening { animation: win-open 0.14s steps(4) both; }
+@keyframes win-open { from { clip-path: inset(40% 40% 40% 40%); } to { clip-path: inset(0 0 0 0); } }
+.screen-menu { background: transparent; }
+
+/* ---- desktop icons ------------------------------------------------------------------------- */
+.desk-icon {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  width: 76px; padding: 4px 2px; background: none; border: 0; color: #fff; cursor: default;
+}
+.desk-icon-img { position: relative; line-height: 0; }
+.desk-icon-label { font-size: 11px; line-height: 1.2; text-align: center; padding: 1px 2px; text-shadow: none; word-break: break-word; }
+.desk-icon.selected .desk-icon-img::after { content: ''; position: absolute; inset: 0; background: rgba(0, 0, 128, 0.55); mix-blend-mode: multiply; }
+.desk-icon.selected .desk-icon-label { background: var(--select); outline: 1px dotted #ffff80; }
+.desk-icon:focus-visible { outline: none; }
+.desk-icon:focus-visible .desk-icon-label { outline: 1px dotted #fff; }
+
+/* ---- taskbar ------------------------------------------------------------------------------- */
+.taskbar {
+  height: 30px; display: flex; align-items: center; gap: 3px; padding: 2px 2px;
+  background: var(--face); box-shadow: inset 0 1px var(--light), inset 0 2px var(--hilight);
+  padding-bottom: calc(2px + env(safe-area-inset-bottom, 0px)); height: calc(30px + env(safe-area-inset-bottom, 0px));
+  position: relative; z-index: 20;
+}
+.start-btn {
+  display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 6px 0 4px;
+  background: var(--face); border: 0; box-shadow: var(--bevel-button); cursor: default; flex: none;
+}
+.start-btn b { font-weight: 700; }
+.start-btn.pressed, .start-btn:active { box-shadow: var(--bevel-pressed); padding: 1px 5px 0 5px; }
+.quick-launch { display: flex; gap: 1px; flex: none; }
+.quick-btn { width: 24px; height: 24px; display: grid; place-items: center; background: none; border: 0; cursor: default; }
+.quick-btn:hover { box-shadow: var(--bevel-thin-raised); }
+.quick-btn:active { box-shadow: var(--bevel-status); }
+.task-buttons { flex: 1; min-width: 0; display: flex; gap: 3px; overflow: hidden; }
+.task-btn {
+  display: inline-flex; align-items: center; gap: 4px; height: 24px; min-width: 0; max-width: 170px; flex: 1 1 170px;
+  padding: 0 6px; background: var(--face); border: 0; box-shadow: var(--bevel-button); cursor: default; text-align: left;
+}
+.task-btn span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-btn.pressed {
+  box-shadow: var(--bevel-pressed); font-weight: 700;
+  background-image: repeating-conic-gradient(var(--hilight) 0 25%, var(--face) 0 50%); background-size: 2px 2px;
+}
+.tray { display: flex; align-items: center; gap: 2px; height: 24px; padding: 0 6px 0 4px; box-shadow: var(--bevel-status); flex: none; }
+.tray-icon { width: 20px; height: 20px; display: grid; place-items: center; background: none; border: 0; padding: 0; cursor: default; }
+.tray-muxa.busy img { animation: buzz 0.18s steps(2) infinite; }
+@keyframes buzz { 50% { transform: translate(1px, -1px) rotate(8deg); } }
+.tray-clock { padding-left: 4px; min-width: 38px; text-align: right; }
+
+.volume-pop { position: fixed; right: 40px; bottom: 36px; z-index: 45; padding: 8px 10px; display: flex; flex-direction: column; align-items: center; gap: 6px; width: 110px; }
+.volume-slider { width: 90px; }
+
+/* ---- Start menu ---------------------------------------------------------------------------- */
+.start-menu {
+  position: fixed; left: 2px; bottom: calc(29px + env(safe-area-inset-bottom, 0px)); z-index: 40;
+  display: none; background: var(--face); box-shadow: var(--bevel-raised); padding: 3px; min-width: 240px;
+}
+.start-menu.open { display: flex; }
+.start-banner {
+  width: 24px; background: linear-gradient(0deg, #000080, #1084d0); position: relative; flex: none;
+  display: flex; align-items: flex-end; justify-content: center; padding-bottom: 6px;
+}
+.start-banner span {
+  writing-mode: vertical-rl; transform: rotate(180deg); color: #c0c0c0; font-family: var(--font-display);
+  font-size: 19px; letter-spacing: 0.02em; white-space: nowrap;
+}
+.start-banner b { color: #fff; font-weight: 700; }
+.start-items { display: flex; flex-direction: column; flex: 1; }
+.start-item {
+  display: flex; align-items: center; gap: 10px; padding: 3px 12px 3px 6px; height: 40px;
+  background: none; border: 0; cursor: default; text-align: left; font-size: 12px; position: relative;
+}
+.start-item:hover, .start-item:focus-visible { background: var(--select); color: var(--select-text); outline: none; }
+.start-arrow { margin-left: auto; font-size: 10px; }
+.menu98-sep { height: 2px; margin: 3px 2px; box-shadow: inset 0 1px var(--shadow), inset 0 -1px var(--hilight); }
+
+/* context / dropdown menus */
+.menu98 {
+  position: fixed; z-index: 60; background: var(--face); box-shadow: var(--bevel-raised); padding: 2px; min-width: 150px;
+  display: flex; flex-direction: column;
+}
+.menu98-item {
+  display: flex; align-items: center; gap: 6px; padding: 3px 16px 3px 4px; background: none; border: 0; text-align: left; cursor: default;
+}
+.menu98-item:hover:not(:disabled), .menu98-item:focus-visible { background: var(--select); color: var(--select-text); outline: none; }
+.menu98-item:disabled { color: var(--shadow); text-shadow: 1px 1px var(--hilight); }
+.menu98-check { width: 12px; text-align: center; }
+.menu98-noicon { width: 16px; }
+.menu98-label { flex: 1; white-space: nowrap; }
+.menu98-key { margin-left: 18px; }
+
+/* ---- dialogs ------------------------------------------------------------------------------- */
+.modal-layer { position: fixed; inset: 0; pointer-events: none; z-index: 50; }
+.modal-wrap { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: auto; padding: 16px; }
+.dialog98 { width: min(460px, 100%); max-height: calc(100vh - 32px); }
+.dialog98-wide { width: min(860px, 100%); }
+.dialog98 > .win-body { overflow: auto; margin: 10px 12px 12px; }
+.modal-body { display: flex; flex-direction: column; gap: 10px; }
+.msgbox { display: flex; flex-direction: column; gap: 14px; min-width: min(300px, 100%); }
+.msgbox-main { display: flex; gap: 14px; align-items: flex-start; }
+.msgbox-text { flex: 1; min-width: 0; padding-top: 2px; }
+.msgbox-text p { margin: 0 0 6px; line-height: 1.4; user-select: text; }
+.msgbox-buttons { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
+
+/* ---- tray balloons (notifications) --------------------------------------------------------- */
+.balloons { position: fixed; right: 8px; bottom: calc(36px + env(safe-area-inset-bottom, 0px)); z-index: 55; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; pointer-events: none; }
+.balloon {
+  pointer-events: auto; display: flex; gap: 8px; align-items: flex-start; max-width: min(340px, calc(100vw - 16px));
+  background: var(--tooltip); border: 1px solid #000; border-radius: 6px; padding: 8px 10px; box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+  opacity: 0; transform: translateY(6px); transition: opacity 0.2s, transform 0.2s; position: relative;
+}
+.balloon::after { content: ''; position: absolute; right: 24px; bottom: -8px; border: 8px solid transparent; border-bottom: 0; border-top-color: #000; }
+.balloon.show { opacity: 1; transform: none; }
+.balloon-text { line-height: 1.35; }
+.balloon-level { background: #fffbd0; font-weight: 700; }
+.balloon-error .balloon-text { color: #800000; }
+
+/* ---- drag & drop hint ---------------------------------------------------------------------- */
+.drop-hint { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; background: rgba(0, 0, 0, 0.25); opacity: 0; pointer-events: none; transition: opacity 0.15s; }
+.drop-hint.show { opacity: 1; }
+.drop-hint-box { width: min(420px, calc(100vw - 32px)); }
+.drop-hint-body { padding: 14px; display: flex; flex-direction: column; gap: 8px; align-items: center; text-align: center; }
+.drop-anim { display: flex; align-items: center; gap: 70px; position: relative; height: 40px; }
+.drop-paper { position: absolute; left: 0; animation: fly-paper 1.2s steps(10) infinite; }
+@keyframes fly-paper { from { transform: translate(0, 0); } 50% { transform: translate(51px, -18px); } to { transform: translate(102px, 0); } }
+
+/* ---- boot / shutdown ----------------------------------------------------------------------- */
+.boot { position: fixed; inset: 0; z-index: 100; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; transition: opacity 0.4s; }
+.boot.hide { opacity: 0; pointer-events: none; }
+.boot-clouds { position: absolute; inset: 0; width: 100%; height: 100%; image-rendering: pixelated; }
+.boot-logo { position: relative; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.boot-fly { width: 96px; height: 96px; filter: drop-shadow(3px 3px 0 rgba(0, 0, 0, 0.35)); }
+.boot-word { font-family: var(--font-display); font-weight: 700; font-size: clamp(56px, 12vw, 96px); color: #fff; line-height: 1; text-shadow: 3px 3px 0 #000080; }
+.boot-word sup { font-size: 0.45em; color: #ffe600; margin-left: 6px; text-shadow: 2px 2px 0 #b30000; }
+.boot-sub { font-family: var(--font-display); font-size: 18px; color: #fff; letter-spacing: 0.2em; text-transform: uppercase; text-shadow: 2px 2px 0 #000080; }
+.boot-status { position: relative; color: #fff; text-shadow: 1px 1px 0 #000; }
+.boot-bar {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 18px;
+  background: linear-gradient(90deg, #000 0%, #0000a0 12%, #3a6ea5 22%, #a0d4ff 30%, #3a6ea5 38%, #0000a0 48%, #000 60%, #000 100%);
+  background-size: 200% 100%; animation: boot-bar 1.4s linear infinite;
+}
+@keyframes boot-bar { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.shutdown-screen {
+  position: fixed; inset: 0; z-index: 200; background: #000; color: #ff8a00; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 12px; font-family: var(--font-display); font-size: clamp(20px, 3vw, 34px); text-align: center; padding: 16px;
+}
+.shutdown-hint { font-size: 14px; color: #804000; font-family: var(--font); }
+
+@media (max-width: 640px) {
+  .quick-launch, .taskbar > .vseparator:nth-of-type(2) { display: none; }
+  .task-btn { max-width: 120px; }
+  .start-menu { min-width: min(260px, calc(100vw - 4px)); }
+}
+
+/* Notepad (help) */
+.notepad-wrap { display: flex; }
+textarea.notepad { width: 100%; height: min(62vh, 540px); white-space: pre; overflow: auto; font-size: 12px; line-height: 1.35; resize: none; }

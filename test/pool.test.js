@@ -4,7 +4,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { handleMessage, benchLevels } from '../src/ai/worker.js';
-import { TrainerPool, trainGeneration } from '../src/ai/pool.js';
+import { TrainerPool, trainGeneration, splitRanges, aggregateUnits, aggregateRuns, BENCH_RUN_LIST, defaultWorkers, SPEEDS } from '../src/ai/pool.js';
+import { episodeNotes } from '../src/ai/trainer.js';
 import { TrainingSession, evaluateCandidates, benchmark, skillFromLevels } from '../src/ai/trainer.js';
 import { packNotes } from '../src/core/map.js';
 import { syntheticMap } from '../src/maps/patterns.js';
@@ -104,4 +105,49 @@ test('trainGeneration (async benchmark) === TrainingSession.step', async () => {
   assert.equal(b.benchEvery, a.benchEvery);
   assert.deepEqual(b.history.map((r) => r.gen), [1, 2, 3, 4, 5, 6, 7]);
   pool.terminate();
+});
+
+test('unit split over many workers (24) === evaluateCandidates, bit for bit', () => {
+  const s = new TrainingSession({ seed: 99, es: { popSize: 16 }, episodesPerGen: 4, episodeDur: 3 });
+  const eps = s.curriculum.episodes(s.rng, 4, 3);
+  const cands = s.es.ask().concat([s.es.theta]);
+  const direct = evaluateCandidates(s.arch, cands, eps, s.hand);
+  const C = cands.length, E = eps.length;
+  for (const W of [1, 3, 24, 100]) {
+    const fit = new Float64Array(C * E), hits = new Int32Array(C * E);
+    for (const [u0, u1] of splitRanges(C * E, W)) {
+      const c0 = Math.floor(u0 / E), c1 = Math.floor((u1 - 1) / E) + 1;
+      const out = handleMessage({ type: 'units', id: 1, arch: s.arch, hand: s.hand, episodes: eps, candidates: cands.slice(c0, c1), c0, u0, u1 });
+      fit.set(out.reply.fit, u0);
+      hits.set(out.reply.hits, u0);
+    }
+    const agg = aggregateUnits(C, eps.map((e) => episodeNotes(e).n), fit, hits);
+    assert.deepEqual(agg, direct, `W=${W}`);
+  }
+});
+
+test('benchmark runs split === trainer.benchmark', () => {
+  const s = smallSession(31);
+  const ref = benchmark(s.arch, s.es.theta, s.hand);
+  const runs = BENCH_RUN_LIST;
+  const hits = new Int32Array(runs.length), n = new Int32Array(runs.length);
+  for (const [a, b] of splitRanges(runs.length, 24)) {
+    const out = handleMessage({ type: 'benchRuns', id: 2, arch: s.arch, params: s.es.theta, hand: s.hand, runs: runs.slice(a, b) });
+    hits.set(out.reply.hits, a);
+    n.set(out.reply.n, a);
+  }
+  const perLevel = aggregateRuns(runs, hits, n);
+  assert.deepEqual(perLevel, ref.perLevel);
+  assert.equal(skillFromLevels(perLevel), ref.skill);
+});
+
+test('worker count presets', () => {
+  assert.equal(defaultWorkers(32), 24);
+  assert.equal(defaultWorkers(4), 2);
+  assert.equal(defaultWorkers(1), 1);
+  assert.equal(SPEEDS.turbo.workers(32), 24);
+  assert.equal(SPEEDS.eco.workers(32), 12);
+  assert.ok(SPEEDS.eco.workers(2) >= 1);
+  assert.deepEqual(splitRanges(10, 4), [[0, 2], [2, 5], [5, 7], [7, 10]]);
+  assert.deepEqual(splitRanges(2, 5), [[0, 1], [1, 2]]);
 });

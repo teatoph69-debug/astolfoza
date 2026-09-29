@@ -49,8 +49,10 @@ export function placeNotes(times, { stars = 3, seed = 1 } = {}) {
   let i = 0;
 
   while (i < items.length) {
-    // choose a pattern segment
-    const segLen = rng.int(3, 10);
+    // choose a pattern segment (a jump stream is kept together as one segment)
+    let segLen = rng.int(3, 10);
+    if (items[i].jump) { segLen = 1; while (i + segLen < items.length && items[i + segLen].jump && segLen < 40) segLen++; }
+    else if (items[i].burst && items[i].hard) { segLen = 1; while (i + segLen < items.length && items[i + segLen].burst && segLen < 16) segLen++; }
     const end = Math.min(items.length, i + segLen);
     const seg = items.slice(i, end);
     const gaps = seg.map((it, k) => (k === 0 ? (i > 0 ? it.t - items[i - 1].t : 1) : it.t - seg[k - 1].t));
@@ -59,7 +61,11 @@ export function placeNotes(times, { stars = 3, seed = 1 } = {}) {
     const hasPitch = seg.filter((s) => s.midi != null).length >= seg.length * 0.7;
 
     let kind;
-    if (isStream && stars > 10 && rng.chance(Math.min(0.85, (stars - 10) * 0.12))) {
+    if (seg[0].jump) {
+      kind = 'jumpstream';
+    } else if (seg[0].burst && seg[0].hard) {
+      kind = 'burstjump';
+    } else if (isStream && stars > 10 && rng.chance(Math.min(0.85, (stars - 10) * 0.12))) {
       // "jump streams": wide shapes at stream speed — only the hardest maps do this
       kind = rng.weighted(['zigzag', 'star', 'mirror', 'triangle', 'square', 'circle'], [2, 1.5, 1.5, 1.5, 1, 1]);
     } else if (isStream) {
@@ -76,6 +82,14 @@ export function placeNotes(times, { stars = 3, seed = 1 } = {}) {
 
     const pts = buildShape(kind, seg, gaps, pos, prevDir, rng, K);
     for (let k = 0; k < seg.length; k++) {
+      if (seg[k].chord) {
+        // chord: a second note at the same moment, one cell away (both reachable from the midpoint)
+        const opts = [{ x: pos.x + 1, y: pos.y }, { x: pos.x - 1, y: pos.y }, { x: pos.x, y: pos.y + 1 }, { x: pos.x, y: pos.y - 1 }]
+          .filter((q) => q.x >= 0 && q.x <= 2 && q.y >= 0 && q.y <= 2);
+        const q = rng.pick(opts);
+        out.push({ t: seg[k].t, x: round3(q.x), y: round3(q.y) });
+        continue;
+      }
       let p = pts[k];
       // enforce the speed limit for this difficulty: pull the note toward the previous one
       const gap = Math.max(0.03, gaps[k]);
@@ -246,6 +260,39 @@ function buildShape(kind, seg, gaps, start, prevDir, rng, K) {
       }
       break;
     }
+    case 'jumpstream': {
+      // cross-grid jumps on every note: corner/edge cells ≥ 1.4 apart, rarely going straight back
+      let p = { x: Math.round(start.x), y: Math.round(start.y) };
+      let prev = null;
+      for (let k = 0; k < n; k++) {
+        let next;
+        for (let tries = 0; tries < 8; tries++) {
+          next = randomCellAway(p, 1.4, 2.83, rng);
+          if (!prev || dist(next, prev) > 0.5 || rng.chance(0.25)) break;
+        }
+        pts.push(next);
+        prev = p;
+        p = next;
+      }
+      break;
+    }
+    case 'burstjump': {
+      // 1/8 bursts where every note moves one cell (the hardest thing in human-made maps)
+      let p = { x: Math.round(start.x), y: Math.round(start.y) };
+      let dir = null;
+      for (let k = 0; k < n; k++) {
+        const opts = CELLS.filter((c) => { const d = dist(c, p); return d > 0.9 && d < 1.5; });
+        let next = rng.pick(opts);
+        if (dir && rng.chance(0.6)) {
+          const back = { x: p.x - dir.x, y: p.y - dir.y };
+          if (back.x >= 0 && back.x <= 2 && back.y >= 0 && back.y <= 2) next = back; // vibro-like back-and-forth
+        }
+        dir = { x: next.x - p.x, y: next.y - p.y };
+        pts.push(next);
+        p = next;
+      }
+      break;
+    }
     case 'jumps':
     default: {
       let p = start;
@@ -283,7 +330,33 @@ export function syntheticTimes(level, seed, duration = 30, lead = 1.0) {
   const restChance = clamp(0.12 - L * 0.01, 0.02, 0.12);
   const p8 = clamp((L - 0.5) / 3.5, 0, 0.9);
   const p16 = L < 5 ? 0 : clamp((L - 5) * 0.035, 0, 0.6);
+  // human-map style elements for the top levels (measured on real SS+/Rhythia maps):
+  // sustained 1/4 "jump streams" at 145–185 BPM with cross-grid jumps, 1/8 bursts, and chords.
+  const jumpChance = L < 11 ? 0 : clamp((L - 11) * 0.085, 0, 0.75);
+  const burstChance = L < 13 ? 0 : clamp((L - 13) * 0.06, 0, 0.4);
+  const chordChance = L < 6 ? 0 : clamp((L - 6) * 0.004, 0, 0.04);
   while (t < duration) {
+    if (rng.chance(jumpChance)) {
+      const step = 60 / rng.float(145 + (L - 11) * 2, 150 + (L - 11) * 5) / 4;
+      const len = rng.int(8, 10 + 3 * Math.floor(L - 11));
+      for (let k = 0; k < len && t < duration; k++) {
+        times.push({ t, strength: 0.8, stream: true, jump: true });
+        t += step;
+      }
+      t += step * 2;
+      continue;
+    }
+    if (rng.chance(burstChance)) {
+      const step = 60 / rng.float(150, 175) / 8;
+      const len = rng.int(3, 6 + Math.floor(Math.max(0, L - 14)));
+      const hard = rng.chance(clamp((L - 14) * 0.15, 0, 0.8));
+      for (let k = 0; k < len && t < duration; k++) {
+        times.push({ t, strength: k === 0 ? 0.9 : 0.3, stream: true, burst: true, hard });
+        t += step;
+      }
+      t += beat / 2;
+      continue;
+    }
     const r = rng.next();
     if (r < streamChance) {
       // burst / stream of fast notes
@@ -299,6 +372,7 @@ export function syntheticTimes(level, seed, duration = 30, lead = 1.0) {
     } else {
       const strong = Math.abs(((t - lead) / beat) % 1) < 0.01;
       times.push({ t, strength: strong ? 0.9 : 0.5 });
+      if (rng.chance(chordChance)) times.push({ t, strength: 0.9, chord: true });
       // subdivision: eighths become common as the level rises, sixteenth doubles appear late
       let div = rng.chance(p8) ? 2 : 1;
       if (rng.chance(p16)) div = 4;

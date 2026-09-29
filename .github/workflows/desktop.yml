@@ -1,0 +1,102 @@
+# Builds the МУХА 98 desktop app (Windows installer + portable .exe, Linux AppImage)
+# and publishes them to the "МУХА 98 (latest build)" GitHub release.
+name: Desktop app
+
+on:
+  push:
+    branches: [main, master, 'claude/**']
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+# Builds run for manual dispatches, pushes to main/master, and branch pushes whose commit message
+# contains "[build]" (so work-in-progress commits don't burn CI minutes).
+jobs:
+  windows:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main' || github.ref_name == 'master' || contains(github.event.head_commit.message, '[build]')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - name: Build Windows installer + portable exe
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist:win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MUXA98-windows
+          path: |
+            desktop/release/*.exe
+          if-no-files-found: error
+
+  linux:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main' || github.ref_name == 'master' || contains(github.event.head_commit.message, '[build]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Build Linux AppImage
+        working-directory: desktop
+        run: |
+          npm install --no-audit --no-fund
+          npm run dist:linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MUXA98-linux
+          path: desktop/release/*.AppImage
+          if-no-files-found: error
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci && npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Collect files
+        run: |
+          mkdir -p upload
+          cp out/*.exe out/*.AppImage upload/
+          cp dist/index.html upload/MUXA98-browser.html
+          ls -la upload
+      - name: Publish "latest build" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: muxa98-latest
+          name: МУХА 98 (latest build)
+          prerelease: true
+          make_latest: false
+          body: |
+            **МУХА 98 — Rhythia Edition**, сборка из ветки `${{ github.ref_name }}` (коммит ${{ github.sha }}).
+
+            | Файл | Что это |
+            |---|---|
+            | `MUXA98-Setup-*.exe` | Установщик для Windows (ярлык на рабочем столе и в «Пуск») |
+            | `MUXA98-Portable-*.exe` | Portable-версия: скачал и запустил, ничего не устанавливается |
+            | `MUXA98-*.AppImage` | Linux |
+            | `MUXA98-browser.html` | Браузерная версия одним файлом: открыть двойным кликом |
+
+            Windows может показать «Windows защитила ваш компьютер», потому что приложение не подписано сертификатом.
+            Нажми «Подробнее» → «Выполнить в любом случае».
+          files: upload/*
+          overwrite_files: true

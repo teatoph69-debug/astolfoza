@@ -32,7 +32,7 @@ export function parseTxtMap(text) {
     if (!Number.isFinite(xt) || !Number.isFinite(yt) || !Number.isFinite(ms) || ms < -60000) { skipped++; continue; }
     notes.push({ t: ms / 1000, x: fix(2 - xt), y: fix(2 - yt) });
   }
-  if (!notes.length || skipped > notes.length) {
+  if (!notes.length || skipped > 3 * notes.length) {
     throw formatError('Это не похоже на текстовую карту Sound Space (ожидается «id,x|y|мс,…»)',
       'This does not look like a Sound Space text map (expected "id,x|y|ms,...")');
   }

@@ -15,7 +15,7 @@ export const NOTE_FEATS = 7;
 export const OBS_SIZE = 5 + OBS_NOTES * NOTE_FEATS;
 export const ACT_SIZE = 2;
 export const DEFAULT_ARCH = [OBS_SIZE, 24, 24, ACT_SIZE];
-const RESPONSE = 40; // 1/s — how aggressively the hand chases the desired velocity
+export const RESPONSE = 40; // 1/s — how aggressively the hand chases the desired velocity
 
 export const HAND_PRESETS = {
   human: { id: 'human', maxAccel: 260, maxSpeed: 12, ru: 'Человеческая рука', en: 'Human hand' },

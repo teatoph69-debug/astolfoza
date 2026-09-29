@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { iconURL } from '../src/ui/icons.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const r = (...p) => path.join(root, ...p);
@@ -46,7 +47,7 @@ export async function build() {
   if (minify) css = (await esbuild.transform(css, { loader: 'css', minify: true })).code;
   const tpl = fs.readFileSync(r('src/index.html'), 'utf8');
   // Use split/join (not String.replace) so "$" sequences inside the bundle are never interpreted.
-  const html = tpl.split('/*__CSS__*/').join(css).split('/*__JS__*/').join(js.replace(/<\/script/gi, '<\\/script'));
+  const html = tpl.split('__FAVICON__').join(iconURL('fly').replace(/"/g, '%22')).split('/*__CSS__*/').join(css).split('/*__JS__*/').join(js.replace(/<\/script/gi, '<\\/script'));
   fs.mkdirSync(r('dist'), { recursive: true });
   fs.writeFileSync(r('dist/index.html'), html);
   // Embeddable variant (no <html>/<head>/<body> wrappers) for hosts that provide their own skeleton.

@@ -17,7 +17,7 @@
 
 import { runEpisode } from './agent.js';
 import { episodeNotes, registerTrainingMap, clearTrainingMaps, skillFromLevels, BENCH_LEVELS } from './trainer.js';
-import { benchEpisode, BENCH_RUNS, netFor } from './worker.js';
+import { benchEpisode, BENCH_RUNS, netFor, evaluateUnits, benchRuns } from './worker.js';
 
 /* global __TRAINER_WORKER_SRC__ */
 function bundledWorkerSource() {
@@ -33,12 +33,70 @@ export function hardwareThreads() {
   return Math.max(1, Math.min(32, n || 4));
 }
 
+/**
+ * Default worker count: leave two hardware threads for the page and the OS, cap at 24
+ * (e.g. i9-14900HX: 32 threads → 24 workers; 4-thread laptop → 2 workers).
+ */
+export function defaultWorkers(hc = hardwareThreads()) {
+  return Math.max(1, Math.min(hc - 2, 24));
+}
+
 /** Training speed presets → worker count (and main-thread slice budget when there are no workers). */
 export const SPEEDS = {
-  eco: { id: 'eco', ru: 'эко', en: 'eco', workers: (hc) => Math.max(1, Math.round(hc / 4)), sliceMs: 5 },
-  norm: { id: 'norm', ru: 'норма', en: 'normal', workers: (hc) => Math.max(1, hc > 2 ? hc - 1 : hc), sliceMs: 9 },
-  turbo: { id: 'turbo', ru: 'турбо', en: 'turbo', workers: (hc) => hc, sliceMs: 12 },
+  eco: { id: 'eco', ru: 'эко', en: 'eco', workers: (hc) => Math.max(1, Math.round(defaultWorkers(hc) / 2)), sliceMs: 5 },
+  norm: { id: 'norm', ru: 'норма', en: 'normal', workers: (hc) => Math.max(1, Math.round(defaultWorkers(hc) * 0.75)), sliceMs: 9 },
+  turbo: { id: 'turbo', ru: 'турбо', en: 'turbo', workers: (hc) => defaultWorkers(hc), sliceMs: 12 },
 };
+export const DEFAULT_SPEED = 'turbo';
+
+/** Split [0, total) into `parts` contiguous, near-equal ranges (empty ones dropped). */
+export function splitRanges(total, parts) {
+  const out = [];
+  for (let k = 0; k < parts; k++) {
+    const a = Math.floor((k * total) / parts), b = Math.floor(((k + 1) * total) / parts);
+    if (b > a) out.push([a, b]);
+  }
+  return out;
+}
+
+/**
+ * Combine per-unit results (unit = candidate × episode) exactly like trainer.evaluateCandidates:
+ * same summation order, so the fitness values are bit-identical.
+ */
+export function aggregateUnits(C, noteCounts, fitPair, hitsPair) {
+  const E = noteCounts.length;
+  let total = 0;
+  for (const n of noteCounts) total += n;
+  const fitness = new Array(C).fill(0);
+  const acc = new Array(C).fill(0);
+  for (let i = 0; i < C; i++) {
+    let f = 0, hits = 0;
+    for (let e = 0; e < E; e++) {
+      const n = noteCounts[e];
+      if (!n) continue;
+      f += fitPair[i * E + e] * n;
+      hits += hitsPair[i * E + e];
+    }
+    fitness[i] = total ? f / total : 0;
+    acc[i] = total ? hits / total : 0;
+  }
+  return { fitness, acc };
+}
+
+/** The benchmark as a flat list of runs [[level, k], …] (21 levels × 2 charts). */
+export const BENCH_RUN_LIST = BENCH_LEVELS.flatMap((L) => Array.from({ length: BENCH_RUNS }, (_, k) => [L, k]));
+
+/** Per-run hits / notes → perLevel (same integer sums as trainer.benchmark). */
+export function aggregateRuns(runs, hits, n) {
+  const byLevel = new Map();
+  runs.forEach(([L], i) => {
+    const e = byLevel.get(L) || { hits: 0, n: 0 };
+    e.hits += hits[i];
+    e.n += n[i];
+    byLevel.set(L, e);
+  });
+  return Array.from(byLevel.entries()).sort((a, b) => a[0] - b[0]).map(([level, e]) => ({ level, acc: e.n ? e.hits / e.n : 0 }));
+}
 
 // ---- cooperative yielding (main-thread fallback) --------------------------------------------------
 
@@ -67,7 +125,7 @@ export class TrainerPool {
    * @param {boolean} [o.forceMain]      never use workers (tests / debugging)
    * @param {number} [o.readyTimeout]    ms to wait for a worker's first pong
    */
-  constructor({ size = SPEEDS.norm.workers(hardwareThreads()), source = bundledWorkerSource(), sliceMs = 12, forceMain = false, readyTimeout = 6000 } = {}) {
+  constructor({ size = defaultWorkers(), source = bundledWorkerSource(), sliceMs = 12, forceMain = false, readyTimeout = 6000 } = {}) {
     this.source = source || '';
     this.sliceMs = sliceMs;
     this.readyTimeout = readyTimeout;
@@ -256,6 +314,7 @@ export class TrainerPool {
 
   /**
    * Evaluate candidates (Float32Array[]) on episode descriptors.
+   * The generation is cut into candidate × episode units, split evenly over the workers.
    * @returns {Promise<{fitness:number[], acc:number[]}>}  same values as trainer.evaluateCandidates
    */
   async evaluate(candidates, episodes, { arch = this.arch, hand = this.hand } = {}) {
@@ -263,29 +322,35 @@ export class TrainerPool {
     await this._init;
     const live = this._alive();
     if (!live.length) return this._evalLocal(arch, candidates, episodes, hand);
+    const C = candidates.length, E = episodes.length;
+    if (!C || !E) return { fitness: new Array(C).fill(0), acc: new Array(C).fill(0) };
     const P = candidates[0].length;
-    const chunks = live.map(() => []);
-    candidates.forEach((_, i) => chunks[i % live.length].push(i));
-    const parts = await Promise.all(live.map((entry, wi) => {
-      const idx = chunks[wi];
-      if (!idx.length) return { fitness: [], acc: [] };
+    const U = C * E;
+    const fitPair = new Float64Array(U);
+    const hitsPair = new Int32Array(U);
+    const ranges = splitRanges(U, live.length);
+    await Promise.all(ranges.map(([u0, u1], wi) => {
+      const c0 = Math.floor(u0 / E), c1 = Math.floor((u1 - 1) / E) + 1;
       // one buffer per worker, transferred (zero-copy); views keep the Float32Array[] contract
-      const buf = new Float32Array(idx.length * P);
-      const views = idx.map((ci, k) => {
-        const v = buf.subarray(k * P, (k + 1) * P);
-        v.set(candidates[ci]);
-        return v;
-      });
-      const recover = () => this._evalLocal(arch, idx.map((ci) => candidates[ci]), episodes, hand);
-      return this._call(entry, { arch, hand, episodes, candidates: views }, [buf.buffer], recover);
+      const buf = new Float32Array((c1 - c0) * P);
+      const views = [];
+      for (let c = c0; c < c1; c++) {
+        const v = buf.subarray((c - c0) * P, (c - c0 + 1) * P);
+        v.set(candidates[c]);
+        views.push(v);
+      }
+      const recover = async () => {
+        await yieldTask();
+        return evaluateUnits(arch, candidates.slice(c0, c1), c0, episodes, u0, u1, hand);
+      };
+      return this._call(live[wi], { type: 'units', arch, hand, episodes, candidates: views, c0, u0, u1 }, [buf.buffer], recover)
+        .then((r) => { fitPair.set(r.fit, u0); hitsPair.set(r.hits, u0); });
     }));
-    const fitness = new Array(candidates.length);
-    const acc = new Array(candidates.length);
-    parts.forEach((r, wi) => chunks[wi].forEach((ci, k) => { fitness[ci] = r.fitness[k]; acc[ci] = r.acc[k]; }));
-    return { fitness, acc };
+    const noteCounts = episodes.map((ep) => episodeNotes(ep).n);
+    return aggregateUnits(C, noteCounts, fitPair, hitsPair);
   }
 
-  /** Skill benchmark (same result as trainer.benchmark), split per level across workers. */
+  /** Skill benchmark (same result as trainer.benchmark), its 42 runs split across workers. */
   async benchmark(arch, params, hand) {
     await this._init;
     const live = this._alive();
@@ -293,19 +358,18 @@ export class TrainerPool {
     if (!live.length) {
       perLevel = await this._benchLocal(arch, params, hand, BENCH_LEVELS);
     } else {
-      const groups = live.map(() => []);
-      BENCH_LEVELS.forEach((L, i) => groups[i % live.length].push(L));
-      const parts = await Promise.all(live.map((entry, wi) => {
-        const levels = groups[wi];
-        if (!levels.length) return [];
+      const runs = BENCH_RUN_LIST;
+      const hits = new Int32Array(runs.length), n = new Int32Array(runs.length);
+      await Promise.all(splitRanges(runs.length, live.length).map(([a, b], wi) => {
+        const part = runs.slice(a, b);
         const p = Float32Array.from(params);
-        const recover = () => this._benchLocal(arch, params, hand, levels).then((perLevel) => ({ perLevel }));
-        return this._call(entry, { type: 'bench', arch, params: p, hand, levels }, [p.buffer], recover).then((r) => r.perLevel);
+        const recover = async () => { await yieldTask(); return benchRuns(arch, Float32Array.from(params), hand, part); };
+        return this._call(live[wi], { type: 'benchRuns', arch, params: p, hand, runs: part }, [p.buffer], recover)
+          .then((r) => { hits.set(r.hits, a); n.set(r.n, a); });
       }));
-      perLevel = parts.flat().sort((a, b) => a.level - b.level);
+      perLevel = aggregateRuns(runs, hits, n);
     }
-    const clean = perLevel.map(({ level, acc }) => ({ level, acc }));
-    return { skill: skillFromLevels(clean), perLevel: clean };
+    return { skill: skillFromLevels(perLevel), perLevel };
   }
 
   // ---- main-thread fallback (time-sliced) -------------------------------------------------------

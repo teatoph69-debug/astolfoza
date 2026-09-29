@@ -270,6 +270,7 @@ const STYLES = {
       gate: 0.9, allow16: false,
     },
     leadDrop: false, teaser: false, preDropGap: 1, roll32: false,
+    breakSub: true,
     sal: { bass: 0.95, lead: 0.85 },
   },
 
@@ -361,6 +362,7 @@ const STYLES = {
       gate: 0.88, allow16: true,
     },
     teaser: true, preDropGap: 0, roll32: false,
+    breakSub: true,
     sal: {},
   },
 };
@@ -499,7 +501,7 @@ function genCellPitches(rng, rhythm, cadence) {
  * Build the song's hook: a motif (rhythm + contour) sequenced over the chord loop as
  * A A A' B (phrase 1) and A A A' C (phrase 2). Returns notes with absolute scale degrees.
  */
-function buildMelody(rng, S, prog) {
+function buildMelody(rng, S, prog, breakProg) {
   const L = S.lead;
   const cb = S.chordBars;
   const cellRhythm = (templates, cadence) => {
@@ -524,11 +526,11 @@ function buildMelody(rng, S, prog) {
   const cells1 = [[rA, pA], [rA, pA], [rA, pA2], [rB, pB]];
   const cells2 = [[rA, pA], [rA, pA], [rA, pA2], [rC, pC]];
   const range = [-2, 10];
-  const realize = (cells) => {
+  const realize = (cells, chords = prog) => {
     let prev = 4;
     const notes = [];
     cells.forEach(([rh, pit], c) => {
-      const root = prog[c % prog.length];
+      const root = chords[c % chords.length];
       const degs = pit.map((p) => p + root);
       let best = 0;
       let bestCost = Infinity;
@@ -554,8 +556,9 @@ function buildMelody(rng, S, prog) {
   };
   const phrases = [realize(cells1), realize(cells2)];
 
-  // Break version: only the notes on beats, held longer.
-  const slow = phrases[0].filter((n) => n.step % 8 === 0 || n.len >= 6);
+  // Break version: the same motif sequenced over the break's chords, only the notes on
+  // half-bar boundaries (or long notes), held longer.
+  const slow = realize(cells1, breakProg).filter((n) => n.step % 8 === 0 || n.len >= 6);
   const brk = slow.map((n, i) => {
     const next = i + 1 < slow.length ? slow[i + 1].step : 16 * 4 * cb;
     return { ...n, len: Math.min(8, next - n.step), acc: 0.9 };
@@ -671,7 +674,7 @@ export function composeSong(def) {
 
   const rDrum = rngFor('drums');
   const rMel = rngFor('melody');
-  const melody = buildMelody(rMel, S, prog);
+  const melody = buildMelody(rMel, S, prog, breakProg);
   const wobbles = S.bass.wobble ? buildWobbles(rngFor('wobble')) : null;
   const stabPat = S.stabs ? rngFor('stabs').pick(S.stabs) : null;
   const gaps = []; // [start, end) windows silenced before drops
@@ -758,8 +761,8 @@ export function composeSong(def) {
         const root = bassRoot(H, ch, S.bassLo);
         const bVel = { intro: 0.7, build: 0.8, drop: 1, break: 0.6, outro: 0.85 }[sec.name] * fade;
         if (sec.name === 'break' || (sec.name === 'intro' && S.bass.wobble)) {
-          // held sub notes, one per chord
-          if (b % cb === 0) push(tAt(bar), 'bass', root, bVel, cb * barDur * 0.96, { wob: 0 });
+          // held notes, one per chord (a clean sine sub for styles whose bass patch is too aggressive)
+          if (b % cb === 0) push(tAt(bar), 'bass', root, bVel, cb * barDur * 0.96, S.breakSub ? { sub: true } : null);
         } else if (S.bass.wobble && (sec.name === 'drop' || sec.name === 'outro' || sec.name === 'build')) {
           if (sec.name === 'drop') {
             if (b % 2 === 0) {
@@ -837,6 +840,7 @@ export function composeSong(def) {
       const secSteps = sec.bars * 16;
       for (let off = 0, pi = 0; off < secSteps; off += spanSteps, pi++) {
         const list = typeof notes === 'function' ? notes(pi) : notes;
+        const placed = [];
         for (const n of list) {
           const st = off + n.step;
           if (st >= secSteps) continue;
@@ -845,7 +849,11 @@ export function composeSong(def) {
           const m = chordMidi(H, ch, n.deg, S.leadOct);
           const dur = Math.min(n.len, secSteps - st) * stepDur * S.lead.gate;
           push(tAt(sec.startBar, st), 'lead', m, vel * n.acc, dur);
-          if (harmony) push(tAt(sec.startBar, st), 'lead', chordMidi(H, ch, n.deg - 2, S.leadOct), vel * n.acc * 0.5, dur);
+          placed.push(events[events.length - 1]);
+          if (harmony) {
+            push(tAt(sec.startBar, st), 'lead', chordMidi(H, ch, n.deg - 2, S.leadOct), vel * n.acc * 0.5, dur);
+            placed.push(events[events.length - 1]);
+          }
         }
         // 16th run into the next phrase (if the phrase ends with a free beat)
         if (ornament && off + spanSteps < secSteps) {
@@ -854,6 +862,9 @@ export function composeSong(def) {
             const target = (typeof notes === 'function' ? notes(pi + 1) : notes)[0].deg;
             const barIn = Math.floor((off + spanSteps - 4) / 16);
             const ch = chordFor(sec, barIn);
+            // cut the held cadence note so the run does not overlap it
+            const runT = tAt(sec.startBar, off + spanSteps - 4);
+            for (const e of placed) if (e.t < runT && e.t + e.dur > runT) e.dur = round6(Math.max(0.02, runT - e.t - stepDur * 0.1));
             for (let i = 0; i < 4; i++) {
               const st = off + spanSteps - 4 + i;
               push(tAt(sec.startBar, st), 'lead', chordMidi(H, ch, target - 4 + i, S.leadOct), vel * (0.62 + 0.08 * i), stepDur * 0.9);
@@ -1047,7 +1058,8 @@ const BLOCK = 32;
 function renderVoice(P, midis, dur, opt) {
   const sr = opt.sr;
   const [aT, dT, sL, rT] = P.amp;
-  const n = Math.max(64, Math.ceil((dur + rT * 6 + 0.005) * sr));
+  // release tail: 3.5 time constants (-30 dB, masked in a full mix), then faded by trimTail
+  const n = Math.max(64, Math.ceil((dur + rT * 3.5 + 0.005) * sr));
   const L = new Float32Array(n);
   const R = new Float32Array(n);
   const rnd = mulberry32(opt.seed >>> 0);
@@ -1106,7 +1118,7 @@ function renderVoice(P, midis, dur, opt) {
   const sub = P.sub || 0;
   const subInc = sub ? mtof(midis[0] + (P.subSemi || 0)) / sr : 0;
   let subPh = 0;
-  const gain = P.gain ?? 1;
+  const gain = (P.gain ?? 1) * (opt.gainMul ?? 1);
 
   const bl = new Float32Array(BLOCK);
   const br = new Float32Array(BLOCK);
@@ -1258,9 +1270,26 @@ function renderVoice(P, midis, dur, opt) {
     }
   }
   if (!stereo) R.set(L);
-  fadeEdges(L, sr, 0.5, 3);
-  fadeEdges(R, sr, 0.5, 3);
-  return [L, R];
+  return trimTail([L, R], sr);
+}
+
+/**
+ * Drop the inaudible end of a sound (below -54 dB of its peak) and fade the new end, so the
+ * mixer does not spend time adding silence. Also fades the very start (click safety).
+ */
+function trimTail(chs, sr, rel = 0.002) {
+  const pk = peakOf(...chs);
+  const thr = pk * rel;
+  let end = chs[0].length;
+  outer: while (end > 64) {
+    for (const c of chs) if (Math.abs(c[end - 1]) > thr) break outer;
+    end--;
+  }
+  const fade = Math.min(end, Math.floor(0.004 * sr));
+  end = Math.min(chs[0].length, end + fade);
+  const out = chs.map((c) => (end < c.length ? c.slice(0, end) : c));
+  for (const c of out) fadeEdges(c, sr, 0.5, 4);
+  return out;
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────
@@ -1397,18 +1426,18 @@ const PATCHES = {
     lead: {
       osc: [{ w: PULSE, pw: 0.25 }],
       amp: [0.001, 0.12, 0.75, 0.03],
-      flt: { f: 9000, q: 0.5 },
+      flt: { f: 6500, q: 0.5 },
       vib: { rate: 6, depth: 0.22, delay: 0.18 },
     },
     arp: {
       osc: [{ w: PULSE, pw: 0.125 }],
       amp: [0.001, 0.08, 0.55, 0.02],
-      flt: { f: 8000, q: 0.5 },
+      flt: { f: 5500, q: 0.5 },
     },
     chord: {
       osc: [{ w: PULSE, pw: 0.5 }],
       amp: [0.005, 0.3, 0.6, 0.1],
-      flt: { f: 5000, q: 0.5 },
+      flt: { f: 4000, q: 0.5 },
     },
     bass: {
       osc: [{ w: NTRI }],
@@ -1466,6 +1495,18 @@ const PATCHES = {
       flt: { f: 700, q: 1.5, env: 2, a: 0.001, d: 0.1, s: 0.2, key: 0.4 },
     },
   },
+};
+
+/**
+ * 808-style sub used for held bass notes in breaks (events with `sub: true`): a sine with a
+ * short downward pitch blip, soft saturation for audibility on small speakers, long decay.
+ */
+const SUB_PATCH = {
+  osc: [{ w: SINE }],
+  pitch: { amt: 7, tau: 0.025 },
+  drive: 1.8,
+  amp: [0.002, 1.4, 0.45, 0.25],
+  flt: { f: 900, q: 0.6 },
 };
 
 // Drum kits: parameters for the one-shot synthesizers below.
@@ -1530,22 +1571,33 @@ const KITS = {
 
 // Mix / FX per style: bus levels (post normalisation), sends, reverb size, delay time (beats).
 const MIX_DEFAULT = {
-  level: { kick: 1.0, snare: 0.62, clap: 0.55, hat: 0.2, openhat: 0.17, bass: 0.95, lead: 0.62, arp: 0.34, chord: 0.36, riser: 0.3, impact: 0.55 },
+  level: { kick: 0.5, snare: 0.85, clap: 1.6, hat: 0.36, openhat: 0.32, bass: 1.35, lead: 0.88, arp: 0.58, chord: 0.32, riser: 0.5, impact: 0.5 },
   rev: { snare: 0.16, clap: 0.2, hat: 0.03, openhat: 0.08, lead: 0.2, arp: 0.24, chord: 0.3, riser: 0.35, impact: 0.3 },
   dly: { lead: 0.16, arp: 0.24 },
   duck: { bass: 0.75, chord: 0.65, arp: 0.35, lead: 0.2, rev: 0.4 },
   reverb: 2.4, damp: 0.6, delayBeats: 0.75, feedback: 0.38, sweep: true,
   pan: { hat: 0.18, openhat: -0.22, arp: 0 },
 };
+// Levels were calibrated from measured stem RMS in the drops (tools/audio-preview/check.mjs
+// --stems all) towards: kick ≈ -12 dB, bass -13, lead -15, snare/clap -16, pads -19, arps -21,
+// hats -28 (pre-master).
 const MIX = {
-  synthwave: { reverb: 3.0, rev: { snare: 0.24 }, level: { snare: 0.58 } },
-  darksynth: { reverb: 2.8, damp: 0.45, rev: { snare: 0.22 }, level: { bass: 0.85 } },
-  house: { reverb: 1.6, delayBeats: 0.75, dly: { chord: 0.18, arp: 0.25 }, level: { chord: 0.42 } },
-  trance: { reverb: 3.2, feedback: 0.45, level: { chord: 0.3, arp: 0.3 } },
-  dubstep: { reverb: 2.2, duck: { bass: 0.45, chord: 0.5 }, level: { bass: 1.0, snare: 0.7 } },
-  chiptune: { reverb: 0.9, damp: 0.8, sweep: false, rev: { lead: 0.08, arp: 0.06, chord: 0.08, snare: 0.05 }, dly: { lead: 0.2, arp: 0.1 }, delayBeats: 0.5, feedback: 0.3, duck: { bass: 0, chord: 0, arp: 0, lead: 0, rev: 0 }, level: { bass: 0.8, lead: 0.5, arp: 0.28, chord: 0.22 } },
-  dnb: { reverb: 2.0, duck: { bass: 0.4, chord: 0.5 }, level: { snare: 0.7, bass: 0.9 } },
-  hardcore: { reverb: 1.8, level: { kick: 1.0, lead: 0.58 } },
+  synthwave: { reverb: 3.0, rev: { snare: 0.24 }, level: { snare: 1.07 } },
+  darksynth: { reverb: 2.8, damp: 0.45, rev: { snare: 0.22 }, level: { kick: 0.45, snare: 1.07, bass: 0.95, arp: 0.73, chord: 0.28 } },
+  house: {
+    reverb: 1.6, delayBeats: 0.75, dly: { chord: 0.18, arp: 0.25 },
+    level: { kick: 0.6, clap: 2.0, hat: 0.44, bass: 2.3, lead: 1.1, arp: 0.8, chord: 0.44 },
+  },
+  trance: { reverb: 3.2, feedback: 0.45, level: { bass: 0.6, clap: 1.8, chord: 0.45 } },
+  dubstep: { reverb: 2.2, duck: { bass: 0.45, chord: 0.5 }, level: { snare: 1.3, bass: 1.2 } },
+  chiptune: {
+    reverb: 0.9, damp: 0.8, sweep: false, delayBeats: 0.5, feedback: 0.3,
+    rev: { lead: 0.08, arp: 0.06, chord: 0.08, snare: 0.05 }, dly: { lead: 0.2, arp: 0.1 },
+    duck: { bass: 0, chord: 0, arp: 0, lead: 0, rev: 0 },
+    level: { kick: 1.75, hat: 0.17, bass: 1.6, arp: 0.82 },
+  },
+  dnb: { reverb: 2.0, duck: { bass: 0.4, chord: 0.5 }, level: { kick: 0.7, snare: 0.75, bass: 0.7, chord: 0.23 } },
+  hardcore: { reverb: 1.8, level: { kick: 0.37, bass: 0.76, clap: 1.3, chord: 0.4 } },
 };
 function mixFor(style) {
   const o = MIX[style] || {};
@@ -1622,10 +1674,12 @@ function synthSnare(p, sr, rnd) {
   const R = new Float32Array(n);
   if (p.chip) {
     const nz = nesNoise(n, sr, 9000, false, rnd);
+    const lp = new SVF(sr);
+    lp.set(8000, 0.6);
     let ph = 0;
     for (let i = 0; i < n; i++) {
       const t = i / sr;
-      let x = nz[i] * Math.exp(-t / p.nd) * 0.7;
+      let x = lp.lp(nz[i]) * Math.exp(-t / p.nd) * 0.7;
       if (p.tone) {
         ph += (p.tone * (1 + Math.exp(-t / 0.02))) / sr;
         const s = Math.floor((ph % 1) * 32);
@@ -1634,30 +1688,34 @@ function synthSnare(p, sr, rnd) {
       L[i] = R[i] = x;
     }
   } else {
-    const hpL = new SVF(sr), hpR = new SVF(sr), bpL = new SVF(sr), bpR = new SVF(sr);
+    // snap: high-passed + band-passed noise burst, rolled off above ~8.5 kHz
+    // body (gated styles only): darker noise plateau imitating a gated reverb, then a hard cut
+    const f = () => new SVF(sr);
+    const hpL = f(), hpR = f(), bpL = f(), bpR = f(), lpL = f(), lpR = f(), dkL = f(), dkR = f();
     hpL.set(p.hp, 0.7); hpR.set(p.hp, 0.7);
     bpL.set(p.bp, 1.2); bpR.set(p.bp, 1.2);
+    lpL.set(7500, 0.6); lpR.set(7500, 0.6);
+    dkL.set(3500, 0.6); dkR.set(3500, 0.6);
     let ph1 = 0, ph2 = 0;
+    const snapTau = p.gate ? 0.05 : p.nd;
     for (let i = 0; i < n; i++) {
       const t = i / sr;
-      const f = p.tone * (1 + 0.25 * Math.exp(-t / 0.015));
-      ph1 += f / sr;
-      ph2 += (f * 1.63) / sr;
+      const fr = p.tone * (1 + 0.25 * Math.exp(-t / 0.015));
+      ph1 += fr / sr;
+      ph2 += (fr * 1.63) / sr;
       const tone = (Math.sin(TWO_PI * ph1) * Math.exp(-t / 0.06) + 0.4 * Math.sin(TWO_PI * ph2) * Math.exp(-t / 0.035)) * p.tLvl;
-      let nenv;
-      if (p.gate) {
-        // gated-reverb snare: dense plateau, then a hard (but click-free) cut
-        const burst = Math.exp(-t / 0.05);
-        const plateau = t < p.gate ? (1 - 0.35 * (t / p.gate)) * p.room : p.room * 0.65 * Math.exp(-(t - p.gate) / 0.012);
-        nenv = Math.max(burst, plateau);
-      } else {
-        nenv = Math.exp(-t / p.nd);
-      }
       const nl = whiteNoise(rnd), nr = whiteNoise(rnd);
-      const xl = (hpL.hp(nl) * 0.7 + bpL.bp(nl) * 0.5) * nenv * p.nLvl;
-      const xr = (hpR.hp(nr) * 0.7 + bpR.bp(nr) * 0.5) * nenv * p.nLvl;
-      L[i] = sclip((tone + xl) * 1.4);
-      R[i] = sclip((tone + xr) * 1.4);
+      const hl = hpL.hp(nl), hr = hpR.hp(nr);
+      const snap = Math.exp(-t / snapTau);
+      let xl = lpL.lp(hl * 0.7 + bpL.bp(nl) * 0.5) * snap;
+      let xr = lpR.lp(hr * 0.7 + bpR.bp(nr) * 0.5) * snap;
+      if (p.gate) {
+        const plateau = t < p.gate ? (1 - 0.35 * (t / p.gate)) * p.room : p.room * 0.65 * Math.exp(-(t - p.gate) / 0.012);
+        xl += dkL.lp(hl) * plateau;
+        xr += dkR.lp(hr) * plateau;
+      }
+      L[i] = sclip((tone + xl * p.nLvl) * 1.4);
+      R[i] = sclip((tone + xr * p.nLvl) * 1.4);
     }
     if (p.clap) {
       const c = synthClap({ bp: 1300, tail: 0.2 }, sr, rnd);
@@ -1707,14 +1765,17 @@ function synthHat(p, sr, rnd) {
   const out = new Float32Array(n);
   if (p.chip) {
     const nz = nesNoise(n, sr, 28000, true, rnd);
-    for (let i = 0; i < n; i++) out[i] = nz[i] * Math.exp(-(i / sr) / p.d) * 0.6;
+    const lp = new SVF(sr);
+    lp.set(10000, 0.6);
+    for (let i = 0; i < n; i++) out[i] = lp.lp(nz[i]) * Math.exp(-(i / sr) / p.d) * 0.6;
   } else {
     // 808-style: six detuned square waves + noise through band/high-pass filters
     const freqs = [205.3, 304.4, 369.6, 522.7, 540, 800].map((f) => f * 1.9);
     const ph = freqs.map(() => rnd());
-    const bp = new SVF(sr), hp = new SVF(sr);
+    const bp = new SVF(sr), hp = new SVF(sr), lp = new SVF(sr);
     bp.set(10000, 1.1);
     hp.set(p.hp, 0.7);
+    lp.set(12500, 0.6);
     for (let i = 0; i < n; i++) {
       const t = i / sr;
       let m = 0;
@@ -1723,9 +1784,9 @@ function synthHat(p, sr, rnd) {
         if (ph[k] >= 1) ph[k] -= 1;
         m += ph[k] < 0.5 ? 1 : -1;
       }
-      const x = m / 6 * 0.6 + whiteNoise(rnd) * 0.5;
+      const x = (m / 6) * 0.6 + whiteNoise(rnd) * 0.35;
       const env = Math.exp(-t / p.d) * (t < 0.0008 ? t / 0.0008 : 1);
-      out[i] = hp.hp(bp.bp(x)) * env * 2.5;
+      out[i] = lp.lp(hp.hp(bp.bp(x))) * env * 2.5;
     }
   }
   fadeEdges(out, sr, 0, 4);
@@ -1736,9 +1797,11 @@ function synthImpact(sr, rnd, chip) {
   const n = Math.ceil(3.0 * sr);
   const L = new Float32Array(n);
   const R = new Float32Array(n);
-  const hl = new SVF(sr), hr = new SVF(sr);
-  hl.set(chip ? 2000 : 3500, 0.7);
-  hr.set(chip ? 2000 : 3500, 0.7);
+  const hl = new SVF(sr), hr = new SVF(sr), ll = new SVF(sr), lr = new SVF(sr);
+  hl.set(chip ? 2000 : 3000, 0.7);
+  hr.set(chip ? 2000 : 3000, 0.7);
+  ll.set(9000, 0.6);
+  lr.set(9000, 0.6);
   const nz = chip ? nesNoise(n, sr, 16000, false, rnd) : null;
   let ph = 0;
   for (let i = 0; i < n; i++) {
@@ -1749,8 +1812,8 @@ function synthImpact(sr, rnd, chip) {
     const env = Math.exp(-t / (chip ? 0.5 : 1.0)) * (t < 0.002 ? t / 0.002 : 1);
     const nl = chip ? nz[i] : whiteNoise(rnd);
     const nr = chip ? nz[i] : whiteNoise(rnd);
-    L[i] = sclip(boom * 1.2) + hl.hp(nl) * env * 0.5;
-    R[i] = sclip(boom * 1.2) + hr.hp(nr) * env * 0.5;
+    L[i] = sclip(boom * 1.2) + ll.lp(hl.hp(nl)) * env * 0.45;
+    R[i] = sclip(boom * 1.2) + lr.lp(hr.hp(nr)) * env * 0.45;
   }
   fadeEdges(L, sr, 0, 30);
   fadeEdges(R, sr, 0, 30);
@@ -1772,10 +1835,11 @@ function synthRiser(dur, sr, rnd) {
     const amp = 0.05 + 0.95 * u * u;
     const sawAmp = 0.22 * u * u * u;
     const m = 48 + 36 * u;
+    for (const v of saws) v.inc = mtof(m + v.d) / sr;
     for (let i = b0; i < Math.min(n, b0 + BLOCK); i++) {
       let s = 0;
       for (const v of saws) {
-        v.p += mtof(m + v.d) / sr;
+        v.p += v.inc;
         if (v.p >= 1) v.p -= 1;
         s += 2 * v.p - 1;
       }
@@ -1888,6 +1952,219 @@ function makeSweep(sections) {
   };
 }
 
+/** Block mixer: instrument buses → sweep / ducking → output, plus delay and reverb sends. */
+class Mixer {
+  constructor({ sr, bpm, MX, plays, kicks, sections, oL, oR, send }) {
+    this.sr = sr;
+    this.oL = oL;
+    this.oR = oR;
+    this.send = send;
+    this.plays = plays;
+    this.pi = 0;
+    this.kicks = kicks;
+    this.buses = [];
+    this.busOf = {};
+    for (const kind of KIND_LIST) {
+      const swept = MX.sweep && SWEPT.has(kind);
+      const bus = {
+        L: new Float32Array(MIX_BLOCK),
+        R: new Float32Array(MIX_BLOCK),
+        active: [],
+        level: MX.level[kind] ?? 0.5,
+        duck: MX.duck[kind] || 0,
+        rev: MX.rev[kind] || 0,
+        dly: MX.dly[kind] || 0,
+        fl: swept ? new SVF(sr) : null,
+        fr: swept ? new SVF(sr) : null,
+        q: kind === 'bass' ? 0.7 : 1.2,
+        open: true, // filter bypassed (fully open)
+        // no per-sample processing (drums, fx): plays are summed straight into the output
+        direct: !swept && !(MX.duck[kind] > 0),
+      };
+      this.buses.push(bus);
+      this.busOf[kind] = bus;
+    }
+    this.dipper = makeDipper(kicks, sr, bpm);
+    this.sweepAt = makeSweep(sections);
+    this.dip = new Float32Array(MIX_BLOCK);
+    this.revBlock = new Float32Array(MIX_BLOCK);
+    this.dlyBlock = new Float32Array(MIX_BLOCK);
+    // ping-pong delay
+    this.D = Math.max(1, Math.round(Math.min(1.9, (60 / bpm) * MX.delayBeats) * sr));
+    this.dBufL = new Float32Array(this.D);
+    this.dBufR = new Float32Array(this.D);
+    this.dIdx = 0;
+    this.hpX = 0;
+    this.hpY = 0;
+    this.fbLp = 0;
+    this.hpA = Math.exp((-TWO_PI * 350) / sr);
+    this.lpA = 1 - Math.exp((-TWO_PI * 3400) / sr);
+    this.fb = MX.feedback;
+    this.x1 = 0; // decimator history
+    this.x2 = 0;
+  }
+
+  process(b0, len) {
+    const b1 = b0 + len;
+    const plays = this.plays;
+    while (this.pi < plays.length && plays[this.pi].s0 < b1) {
+      const p = plays[this.pi++];
+      this.busOf[p.kind].active.push(p);
+    }
+    this.dipper(this.dip, b0, len);
+    this.revBlock.fill(0);
+    this.dlyBlock.fill(0);
+    const fc = this.sweepAt((b0 + len / 2) / this.sr);
+    for (const bus of this.buses) {
+      if (!bus.active.length) bus.open = true;
+      else if (bus.direct) this.mixDirect(bus, b0, b1);
+      else this.mixProcessed(bus, b0, b1, fc);
+    }
+    this.pingPong(b0, len);
+    this.decimate(b0, len);
+  }
+
+  mixDirect(bus, b0, b1) {
+    const oL = this.oL, oR = this.oR, rb = this.revBlock, db = this.dlyBlock;
+    const act = bus.active;
+    let keep = 0;
+    for (let a = 0; a < act.length; a++) {
+      const p = act[a];
+      const end = p.s0 + p.L.length;
+      const from = p.s0 > b0 ? p.s0 : b0;
+      const to = end < b1 ? end : b1;
+      const pl = p.L, pr = p.R, off = p.s0;
+      const g = p.g * bus.level;
+      const gr = g * bus.rev * 0.5, gd = g * bus.dly * 0.5;
+      for (let i = from; i < to; i++) {
+        const l = pl[i - off], r = pr[i - off];
+        oL[i] += l * g;
+        oR[i] += r * g;
+      }
+      if (gr) for (let i = from; i < to; i++) rb[i - b0] += (pl[i - off] + pr[i - off]) * gr;
+      if (gd) for (let i = from; i < to; i++) db[i - b0] += (pl[i - off] + pr[i - off]) * gd;
+      if (end > b1) act[keep++] = p;
+    }
+    act.length = keep;
+  }
+
+  mixProcessed(bus, b0, b1, fc) {
+    const L = bus.L, R = bus.R, len = b1 - b0;
+    L.fill(0);
+    R.fill(0);
+    const act = bus.active;
+    let keep = 0;
+    for (let a = 0; a < act.length; a++) {
+      const p = act[a];
+      const end = p.s0 + p.L.length;
+      const from = p.s0 > b0 ? p.s0 : b0;
+      const to = end < b1 ? end : b1;
+      const pl = p.L, pr = p.R, g = p.g;
+      const o1 = p.s0, o2 = b0;
+      for (let i = from; i < to; i++) {
+        L[i - o2] += pl[i - o1] * g;
+        R[i - o2] += pr[i - o1] * g;
+      }
+      if (end > b1) act[keep++] = p;
+    }
+    act.length = keep;
+
+    if (bus.fl) {
+      if (fc < 18000) {
+        const fl = bus.fl, fr = bus.fr;
+        if (bus.open) {
+          fl.ic1 = fl.ic2 = fr.ic1 = fr.ic2 = 0;
+          bus.open = false;
+        }
+        fl.set(fc, bus.q);
+        fr.set(fc, bus.q);
+        for (let i = 0; i < len; i++) {
+          L[i] = fl.lp(L[i]);
+          R[i] = fr.lp(R[i]);
+        }
+      } else bus.open = true;
+    }
+
+    const oL = this.oL, oR = this.oR, dip = this.dip, rb = this.revBlock, db = this.dlyBlock;
+    const lvl = bus.level, depth = bus.duck * lvl, rv = bus.rev * 0.5, dl = bus.dly * 0.5;
+    for (let i = 0; i < len; i++) {
+      const g = lvl - depth * dip[i];
+      const l = L[i] * g, r = R[i] * g;
+      oL[b0 + i] += l;
+      oR[b0 + i] += r;
+      L[i] = l + r; // reuse as the mono send signal
+    }
+    if (rv) for (let i = 0; i < len; i++) rb[i] += L[i] * rv;
+    if (dl) for (let i = 0; i < len; i++) db[i] += L[i] * dl;
+  }
+
+  /** Ping-pong delay: left line → right line → (filtered feedback) → left line. */
+  pingPong(b0, len) {
+    const DLY_OUT = 0.8, DLY_REV = 0.125;
+    const x0 = this.dlyBlock, rb = this.revBlock, oL = this.oL, oR = this.oR;
+    const bl = this.dBufL, br = this.dBufR, D = this.D, hpA = this.hpA, lpA = this.lpA, fb = this.fb;
+    let { dIdx, hpX, hpY, fbLp } = this;
+    for (let i = 0; i < len; i++) {
+      const x = x0[i];
+      hpY = hpA * (hpY + x - hpX);
+      hpX = x;
+      const eL = bl[dIdx], eR = br[dIdx];
+      fbLp += lpA * (eR - fbLp);
+      bl[dIdx] = hpY + fb * fbLp;
+      br[dIdx] = eL;
+      if (++dIdx >= D) dIdx = 0;
+      oL[b0 + i] += (eL * 0.9 + eR * 0.1) * DLY_OUT;
+      oR[b0 + i] += (eR * 0.9 + eL * 0.1) * DLY_OUT;
+      rb[i] += (eL + eR) * DLY_REV;
+    }
+    this.dIdx = dIdx;
+    this.hpX = hpX;
+    this.hpY = hpY;
+    this.fbLp = fbLp;
+  }
+
+  /** 2:1 decimation of the reverb send ([1 2 1] / 4 kernel) into the half-rate buffer. */
+  decimate(b0, len) {
+    const rb = this.revBlock, send = this.send;
+    let x1 = this.x1, x2 = this.x2;
+    for (let i = 0; i < len; i++) {
+      const gi = b0 + i;
+      const x = rb[i];
+      if (gi & 1) send[gi >> 1] = 0.25 * x2 + 0.5 * x1 + 0.25 * x;
+      x2 = x1;
+      x1 = x;
+    }
+    this.x1 = x1;
+    this.x2 = x2;
+  }
+}
+
+/** Add the half-rate reverb return (linearly interpolated, sidechain-ducked) to the output. */
+function addReverbReturn(oL, oR, wL, wR, kicks, sr, bpm, depth) {
+  const N = oL.length;
+  const M = wL.length;
+  const dip = new Float32Array(MIX_BLOCK);
+  const dipper = makeDipper(kicks, sr, bpm);
+  const RET = 0.9;
+  for (let b0 = 0; b0 < N; b0 += MIX_BLOCK) {
+    const len = Math.min(MIX_BLOCK, N - b0);
+    dipper(dip, b0, len);
+    for (let i = 0; i < len; i++) {
+      const gi = b0 + i;
+      const j = gi >> 1;
+      if (j >= M) break;
+      const g = RET * (1 - depth * dip[i]);
+      let l = wL[j], r = wR[j];
+      if (gi & 1 && j + 1 < M) {
+        l = 0.5 * (l + wL[j + 1]);
+        r = 0.5 * (r + wR[j + 1]);
+      }
+      oL[gi] += l * g;
+      oR[gi] += r * g;
+    }
+  }
+}
+
 function makeAudioBuffer(OAC, channels, length, sampleRate) {
   try {
     return new AudioBuffer({ numberOfChannels: channels, length, sampleRate });
@@ -1949,23 +2226,24 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
     for (let i = 0; i < x.length; i++) { L[i] = x[i] * gl; R[i] = x[i] * gr; }
     return [L, R];
   };
-  const kick = normPeak([synthKick(KT.kick, sr, rnd)])[0];
+  const kick = trimTail(normPeak([synthKick(KT.kick, sr, rnd)]), sr)[0];
   const drums = {
     kick: [kick, kick],
-    snare: normPeak(synthSnare(KT.snare, sr, rnd)),
-    clap: normPeak(synthClap(KT.clap, sr, rnd)),
-    hat: normPeak(panMono(synthHat(KT.hat, sr, rnd), MX.pan.hat)),
-    openhat: normPeak(panMono(synthHat(KT.openhat, sr, rnd), MX.pan.openhat)),
-    impact: normPeak(synthImpact(sr, rnd, style === 'chiptune')),
+    snare: trimTail(normPeak(synthSnare(KT.snare, sr, rnd)), sr),
+    clap: trimTail(normPeak(synthClap(KT.clap, sr, rnd)), sr),
+    hat: trimTail(normPeak(panMono(synthHat(KT.hat, sr, rnd), MX.pan.hat)), sr),
+    openhat: trimTail(normPeak(panMono(synthHat(KT.openhat, sr, rnd), MX.pan.openhat)), sr),
+    impact: trimTail(normPeak(synthImpact(sr, rnd, style === 'chiptune')), sr),
   };
 
   // Tonal voices are loudness-normalised per patch (RMS of a reference note), so bus levels
   // in MIX mean the same thing for every style.
   const norms = new Map();
-  const REF = { lead: 72, arp: 72, chord: 64, bass: 40 };
+  const REF = { lead: 72, arp: 72, chord: 64, bass: 40, sub: 40 };
+  const patchOf = (kind) => (kind === 'sub' ? SUB_PATCH : PT[kind]);
   const patchNorm = (kind) => {
     if (!norms.has(kind)) {
-      const [L, R] = renderVoice(PT[kind], [REF[kind]], 0.5, { sr, bpm, wob: 0, vel: 1, seed: 7 });
+      const [L, R] = renderVoice(patchOf(kind), [REF[kind]], 0.5, { sr, bpm, wob: 0, vel: 1, seed: 7 });
       const m = Math.min(L.length, Math.floor(0.5 * sr));
       let s = 0;
       for (let i = 0; i < m; i++) s += L[i] * L[i] + R[i] * R[i];
@@ -1975,15 +2253,13 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
   };
   const cache = new Map();
   const voice = (kind, midis, dur, e) => {
-    const P = PT[kind];
+    const P = patchOf(kind);
     const velQ = P.flt && P.flt.vel ? Math.round((e.vel ?? 1) * 4) / 4 : 1;
     const durQ = Math.round(dur * 200) / 200;
     const key = `${kind}|${midis.join(',')}|${durQ}|${e.wob ?? ''}|${velQ}`;
     let v = cache.get(key);
     if (!v) {
-      v = renderVoice(P, midis, durQ, { sr, bpm, wob: e.wob || 0, vel: velQ, seed: hashString(key) });
-      const g = patchNorm(kind);
-      for (const c of v) for (let i = 0; i < c.length; i++) c[i] *= g;
+      v = renderVoice(P, midis, durQ, { sr, bpm, wob: e.wob || 0, vel: velQ, seed: hashString(key), gainMul: patchNorm(kind) });
       cache.set(key, v);
     }
     return v;
@@ -2011,7 +2287,8 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
       const midis = group.map((x) => x.midi).sort((a, b) => a - b);
       g = group.reduce((a, x) => a + x.vel, 0) / group.length;
       buf = voice('chord', midis, e.dur, e);
-    } else if (PT[e.kind]) buf = voice(e.kind, [e.midi], e.dur, e);
+    } else if (e.kind === 'bass' && e.sub) buf = voice('sub', [e.midi], e.dur, e);
+    else if (PT[e.kind]) buf = voice(e.kind, [e.midi], e.dur, e);
     if (buf) plays.push({ s0: Math.round(e.t * sr), L: buf[0], R: buf[1], g, kind: e.kind });
     if ((i & 31) === 0) await maybeYield(0.4 * (i / evs.length));
   }
@@ -2028,128 +2305,12 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
   const sendBuf = rctx.createBuffer(1, M, rsr);
   const send = sendBuf.getChannelData(0);
 
-  const bus = {};
-  for (const kind of KIND_LIST) {
-    const swept = MX.sweep && SWEPT.has(kind);
-    bus[kind] = {
-      L: new Float32Array(MIX_BLOCK),
-      R: new Float32Array(MIX_BLOCK),
-      active: [],
-      level: MX.level[kind] ?? 0.5,
-      duck: MX.duck[kind] || 0,
-      rev: MX.rev[kind] || 0,
-      dly: MX.dly[kind] || 0,
-      fl: swept ? new SVF(sr) : null,
-      fr: swept ? new SVF(sr) : null,
-      q: kind === 'bass' ? 0.7 : 1.2,
-      open: true, // filter bypassed (fully open)
-    };
-  }
-  const kicks = muted.has('kick') ? [] : comp.events.filter((e) => e.kind === 'kick');
-  const dipper = makeDipper(kicks, sr, bpm);
-  const sweepAt = makeSweep(comp.sections);
-  const dip = new Float32Array(MIX_BLOCK);
-  const revBlock = new Float32Array(MIX_BLOCK);
-  const dlyBlock = new Float32Array(MIX_BLOCK);
-
-  // ping-pong delay state
-  const D = Math.max(1, Math.round(Math.min(1.9, (60 / bpm) * MX.delayBeats) * sr));
-  const dBufL = new Float32Array(D);
-  const dBufR = new Float32Array(D);
-  let dIdx = 0, hpX = 0, hpY = 0, fbLp = 0;
-  const hpA = Math.exp((-TWO_PI * 350) / sr);
-  const lpA = 1 - Math.exp((-TWO_PI * 3400) / sr);
-  const fb = MX.feedback;
-  const DLY_OUT = 0.8;
-  const DLY_REV = 0.25;
-  let x1 = 0, x2 = 0; // decimator history
-
-  let pi = 0;
+  const mixer = new Mixer({
+    sr, bpm, MX, plays, sections: comp.sections, oL, oR, send,
+    kicks: muted.has('kick') ? [] : comp.events.filter((e) => e.kind === 'kick'),
+  });
   for (let b0 = 0; b0 < N; b0 += MIX_BLOCK) {
-    const len = Math.min(MIX_BLOCK, N - b0);
-    const b1 = b0 + len;
-    while (pi < plays.length && plays[pi].s0 < b1) {
-      bus[plays[pi].kind].active.push(plays[pi]);
-      pi++;
-    }
-    dipper(dip, b0, len);
-    revBlock.fill(0);
-    dlyBlock.fill(0);
-    const fc = sweepAt((b0 + len / 2) / sr);
-
-    for (let k = 0; k < KIND_LIST.length; k++) {
-      const s = bus[KIND_LIST[k]];
-      if (!s.active.length) {
-        s.open = true;
-        continue;
-      }
-      const L = s.L, R = s.R;
-      L.fill(0);
-      R.fill(0);
-      let keep = 0;
-      for (let a = 0; a < s.active.length; a++) {
-        const p = s.active[a];
-        const end = p.s0 + p.L.length;
-        const from = p.s0 > b0 ? p.s0 : b0;
-        const to = end < b1 ? end : b1;
-        const pl = p.L, pr = p.R, g = p.g, off = p.s0;
-        for (let i = from; i < to; i++) {
-          L[i - b0] += pl[i - off] * g;
-          R[i - b0] += pr[i - off] * g;
-        }
-        if (end > b1) s.active[keep++] = p;
-      }
-      s.active.length = keep;
-
-      if (s.fl) {
-        if (fc < 18000) {
-          if (s.open) {
-            s.fl.ic1 = s.fl.ic2 = s.fr.ic1 = s.fr.ic2 = 0;
-            s.open = false;
-          }
-          s.fl.set(fc, s.q);
-          s.fr.set(fc, s.q);
-          for (let i = 0; i < len; i++) {
-            L[i] = s.fl.lp(L[i]);
-            R[i] = s.fr.lp(R[i]);
-          }
-        } else s.open = true;
-      }
-
-      const lvl = s.level, depth = s.duck, rv = s.rev, dl = s.dly;
-      for (let i = 0; i < len; i++) {
-        const g = (depth ? 1 - depth * dip[i] : 1) * lvl;
-        const l = L[i] * g, r = R[i] * g;
-        oL[b0 + i] += l;
-        oR[b0 + i] += r;
-        if (rv) revBlock[i] += (l + r) * 0.5 * rv;
-        if (dl) dlyBlock[i] += (l + r) * 0.5 * dl;
-      }
-    }
-
-    // ping-pong delay: left line → right line → (filtered feedback) → left line
-    for (let i = 0; i < len; i++) {
-      const x = dlyBlock[i];
-      hpY = hpA * (hpY + x - hpX);
-      hpX = x;
-      const eL = dBufL[dIdx], eR = dBufR[dIdx];
-      fbLp += lpA * (eR - fbLp);
-      dBufL[dIdx] = hpY + fb * fbLp;
-      dBufR[dIdx] = eL;
-      if (++dIdx >= D) dIdx = 0;
-      oL[b0 + i] += (eL * 0.9 + eR * 0.1) * DLY_OUT;
-      oR[b0 + i] += (eR * 0.9 + eL * 0.1) * DLY_OUT;
-      revBlock[i] += (eL + eR) * 0.5 * DLY_REV;
-    }
-
-    // 2:1 decimation of the reverb send ([1 2 1] / 4 kernel)
-    for (let i = 0; i < len; i++) {
-      const gi = b0 + i;
-      const x = revBlock[i];
-      if (gi & 1) send[gi >> 1] = 0.25 * x2 + 0.5 * x1 + 0.25 * x;
-      x2 = x1;
-      x1 = x;
-    }
+    mixer.process(b0, Math.min(MIX_BLOCK, N - b0));
     if ((b0 & 0xffff) === 0) await maybeYield(0.4 + 0.3 * (b0 / N));
   }
   const tMix = now();
@@ -2172,30 +2333,8 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
   const wet = await rctx.startRendering();
   const tRev = now();
 
-  // ── 4. reverb return (ducked, linear-interpolated back to full rate) + master ──
-  {
-    const wL = wet.getChannelData(0);
-    const wR = wet.getChannelData(1);
-    const dip2 = makeDipper(kicks, sr, bpm);
-    const depth = MX.duck.rev || 0;
-    const RET = 0.9;
-    for (let b0 = 0; b0 < N; b0 += MIX_BLOCK) {
-      const len = Math.min(MIX_BLOCK, N - b0);
-      dip2(dip, b0, len);
-      for (let i = 0; i < len; i++) {
-        const gi = b0 + i;
-        const j = gi >> 1;
-        const g = RET * (1 - depth * dip[i]);
-        let l = wL[j], r = wR[j];
-        if (gi & 1 && j + 1 < M) {
-          l = 0.5 * (l + wL[j + 1]);
-          r = 0.5 * (r + wR[j + 1]);
-        }
-        oL[gi] += l * g;
-        oR[gi] += r * g;
-      }
-    }
-  }
+  // ── 4. reverb return (ducked, interpolated back to full rate) + master ──
+  addReverbReturn(oL, oR, wet.getChannelData(0), wet.getChannelData(1), mixer.kicks, sr, bpm, MX.duck.rev || 0);
   progress(0.85);
   await yieldToUI();
   if (doMaster) masterBus(out, comp, sr);
@@ -2215,111 +2354,126 @@ export async function renderSong(comp, { sampleRate = 44100, onProgress, mute, m
 }
 
 // ────────────────────────────────────────────────────────────────────────────────────────────
-//  Master bus: loudness normalisation → glue compressor → look-ahead brick-wall limiter
+//  Master bus: high shelf → loudness normalisation → glue compressor → look-ahead limiter
 // ────────────────────────────────────────────────────────────────────────────────────────────
 
 const TARGET_DROP_RMS = 0.25;
 const CEILING = 0.95;
 
+/** RMS over the drop sections (the loudest part of every song), or the whole song. */
 function sectionRms(L, R, sr, sections) {
-  let s = 0, n = 0;
-  for (const sec of sections) {
-    if (sec.name !== 'drop') continue;
-    const a = Math.floor(sec.start * sr), b = Math.min(L.length, Math.floor(sec.end * sr));
-    for (let i = a; i < b; i += 2) { s += L[i] * L[i] + R[i] * R[i]; n += 2; }
-  }
-  if (!n) {
-    for (let i = 0; i < L.length; i += 2) { s += L[i] * L[i] + R[i] * R[i]; n += 2; }
-  }
+  let s = 0;
+  let n = 0;
+  const acc = (a, b) => {
+    for (let i = a; i < b; i += 2) s += L[i] * L[i] + R[i] * R[i];
+    n += Math.max(0, Math.ceil((b - a) / 2)) * 2;
+  };
+  for (const sec of sections) if (sec.name === 'drop') acc(Math.floor(sec.start * sr), Math.min(L.length, Math.floor(sec.end * sr)));
+  if (!n) acc(0, L.length);
   return Math.sqrt(s / Math.max(1, n));
 }
 
-function applyGain(L, R, g) {
-  for (let i = 0; i < L.length; i++) { L[i] *= g; R[i] *= g; }
-}
-
-/** RMS-detecting feed-forward compressor (stereo linked), gain computed every 16 samples. */
-function compress(L, R, sr, { threshDb = -14, ratio = 2.5, kneeDb = 6, attack = 0.01, release = 0.15 } = {}) {
+/**
+ * RMS-detecting feed-forward compressor (stereo linked), gain computed every 16 samples and
+ * interpolated. `inGain` is applied first (saves a separate gain pass).
+ */
+function compress(L, R, sr, { inGain = 1, threshDb = -14, ratio = 2.5, kneeDb = 6, attack = 0.01, release = 0.15 } = {}) {
   const n = L.length;
   const D = 16;
   const aA = Math.exp(-D / (attack * sr));
   const aR = Math.exp(-D / (release * sr));
+  const slope = 1 - 1 / ratio;
   let env = 0;
-  let prevG = 1;
+  let prevG = inGain;
   for (let b0 = 0; b0 < n; b0 += D) {
     const b1 = Math.min(n, b0 + D);
     let s = 0;
     for (let i = b0; i < b1; i++) s += L[i] * L[i] + R[i] * R[i];
-    const ms = s / (2 * (b1 - b0));
+    const ms = (s * inGain * inGain) / (2 * (b1 - b0));
     env = ms > env ? aA * env + (1 - aA) * ms : aR * env + (1 - aR) * ms;
-    const db = 10 * Math.log10(env + 1e-12);
-    const over = db - threshDb;
+    const over = 10 * Math.log10(env + 1e-12) - threshDb;
     let gr = 0;
-    if (over > kneeDb / 2) gr = over * (1 - 1 / ratio);
-    else if (over > -kneeDb / 2) gr = ((over + kneeDb / 2) ** 2 / (2 * kneeDb)) * (1 - 1 / ratio);
-    const g = Math.pow(10, -gr / 20);
-    // interpolate gain across the block to avoid zipper noise
+    if (over > kneeDb / 2) gr = over * slope;
+    else if (over > -kneeDb / 2) gr = ((over + kneeDb / 2) ** 2 / (2 * kneeDb)) * slope;
+    const g = inGain * Math.pow(10, -gr / 20);
     const len = b1 - b0;
-    for (let i = 0; i < len; i++) {
-      const gi = prevG + (g - prevG) * (i / len);
-      L[b0 + i] *= gi;
-      R[b0 + i] *= gi;
+    const step = (g - prevG) / len;
+    let gi = prevG;
+    for (let i = b0; i < b1; i++) {
+      L[i] *= gi;
+      R[i] *= gi;
+      gi += step;
     }
     prevG = g;
   }
 }
 
 /**
- * Zero-latency look-ahead limiter: the gain curve is the box-smoothed running minimum of the
- * required gain, which provably keeps |x·g| ≤ ceiling, followed by an exponential release.
+ * Zero-latency look-ahead brick-wall limiter (single pass, ring buffers).
+ * Gain = box-smoothed running minimum of the required gain over a W-sample window, which
+ * provably keeps |x·g| ≤ ceiling; followed by an exponential release. `inGain` is applied first.
  */
-function limit(L, R, sr, ceiling = CEILING, lookMs = 3, relMs = 80) {
+function limit(L, R, sr, { inGain = 1, ceiling = CEILING, lookMs = 3, relMs = 80 } = {}) {
   const n = L.length;
   const W = Math.max(2, Math.round((lookMs / 1000) * sr));
-  const req = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    const a = Math.max(Math.abs(L[i]), Math.abs(R[i]));
-    req[i] = a > ceiling ? ceiling / a : 1;
-  }
-  // M[i] = min(req[i-W+1 .. i]) via monotonic deque
-  const M = new Float32Array(n);
-  const dq = new Int32Array(n);
-  let h = 0, tl = 0;
-  for (let i = 0; i < n; i++) {
-    while (tl > h && req[dq[tl - 1]] >= req[i]) tl--;
-    dq[tl++] = i;
-    if (dq[h] <= i - W) h++;
-    M[i] = req[dq[h]];
-  }
-  // g[k] = mean(M[k .. k+W-1]) then release smoothing (can only lower the gain further)
+  let size = 1;
+  while (size < W + 1) size <<= 1;
+  const mask = size - 1;
+  const reqRing = new Float32Array(size); // required gain per sample
+  const mRing = new Float32Array(size); // M[i] = min(req[i-W+1 .. i])
+  const dq = new Int32Array(size); // monotonic deque of sample indices (ring)
   const rc = 1 - Math.exp(-1 / ((relMs / 1000) * sr));
-  let sum = 0;
-  for (let i = 0; i < Math.min(W, n); i++) sum += M[i];
+  let h = 0, t = 0; // deque head / tail counters (masked on access)
+  let sum = W; // running sum of the last W values of M (virtual 1s before the start)
   let g2 = 1;
-  for (let k = 0; k < n; k++) {
-    const cnt = Math.min(W, n - k);
-    const g = cnt === W ? sum / W : Math.min(sum / cnt, 1);
-    g2 = Math.min(g, g2 + (1 - g2) * rc);
-    L[k] *= g2;
-    R[k] *= g2;
-    sum -= M[k];
-    if (k + W < n) sum += M[k + W];
+  const total = n + W - 1;
+  for (let i = 0; i < total; i++) {
+    let req = 1;
+    if (i < n) {
+      const a = Math.max(Math.abs(L[i]), Math.abs(R[i])) * inGain;
+      if (a > ceiling) req = ceiling / a;
+    }
+    reqRing[i & mask] = req;
+    while (t > h && reqRing[dq[(t - 1) & mask] & mask] >= req) t--;
+    dq[t & mask] = i;
+    t++;
+    if (dq[h & mask] <= i - W) h++;
+    const m = reqRing[dq[h & mask] & mask];
+    sum += m - (i >= W ? mRing[(i - W) & mask] : 1);
+    mRing[i & mask] = m;
+    const k = i - W + 1; // sample whose W-window of M is now complete
+    if (k < 0) continue;
+    const g = sum / W;
+    g2 = g < g2 + (1 - g2) * rc ? g : g2 + (1 - g2) * rc;
+    const gg = g2 * inGain;
+    let l = L[k] * gg, r = R[k] * gg;
+    if (l > ceiling) l = ceiling; else if (l < -ceiling) l = -ceiling; // float-rounding guard
+    if (r > ceiling) r = ceiling; else if (r < -ceiling) r = -ceiling;
+    L[k] = l;
+    R[k] = r;
   }
-  for (let i = 0; i < n; i++) {
-    if (L[i] > ceiling) L[i] = ceiling; else if (L[i] < -ceiling) L[i] = -ceiling;
-    if (R[i] > ceiling) R[i] = ceiling; else if (R[i] < -ceiling) R[i] = -ceiling;
+}
+
+/** Gentle high shelf (≈ -2.5 dB above ~7 kHz): tames synthetic fizz without dulling the mix. */
+function tiltHighs(L, R, sr, cut = 0.25, fc = 7000) {
+  const a = Math.exp((-TWO_PI * fc) / sr);
+  let lL = 0, lR = 0;
+  for (let i = 0; i < L.length; i++) {
+    lL = a * lL + (1 - a) * L[i]; // one-pole low-pass; x - lp = high band
+    lR = a * lR + (1 - a) * R[i];
+    L[i] -= (L[i] - lL) * cut;
+    R[i] -= (R[i] - lR) * cut;
   }
 }
 
 function masterBus(buf, comp, sr) {
   const L = buf.getChannelData(0);
   const R = buf.getChannelData(1);
-  let rms = sectionRms(L, R, sr, comp.sections);
-  applyGain(L, R, clamp(0.2 / (rms || 1), 0.05, 50));
-  compress(L, R, sr, { threshDb: -16, ratio: 2.5, kneeDb: 8, attack: 0.012, release: 0.16 });
-  rms = sectionRms(L, R, sr, comp.sections);
-  applyGain(L, R, clamp(TARGET_DROP_RMS / (rms || 1), 0.05, 50));
-  limit(L, R, sr, CEILING);
+  tiltHighs(L, R, sr);
+  const rms0 = sectionRms(L, R, sr, comp.sections) || 1;
+  compress(L, R, sr, { inGain: clamp(0.2 / rms0, 0.05, 50), threshDb: -16, ratio: 2.5, kneeDb: 8, attack: 0.012, release: 0.16 });
+  const rms1 = sectionRms(L, R, sr, comp.sections) || 1;
+  limit(L, R, sr, { inGain: clamp(TARGET_DROP_RMS / rms1, 0.05, 50), ceiling: CEILING });
 }
 
 /** Style ids known to the engine (for tools / debug UIs). */

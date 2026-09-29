@@ -1,37 +1,41 @@
 // Auto-mapper: turns any audio into playable maps (5 difficulties).
 //
-// Pipeline (pure JS, no dependencies, ~0.3–0.6 s for a 3-minute song):
-//   1. downmix to mono, decimate to ~22 kHz, loudness-normalise;
-//   2. STFT (1024-point Hann, hop 256 ≈ 11.6 ms) with a small radix-2 real FFT;
-//   3. log-magnitude spectral flux ("SuperFlux"-style: compared with a frequency-max-filtered frame two hops
-//      back) in three bands — low (kick/bass), mid (snare body/instruments/vocals), high (hats/noise);
-//   4. onset detection function = weighted, per-band-normalised flux; adaptive threshold (moving mean) and
-//      peak picking; sub-frame timing by parabolic interpolation;
-//   5. tempo: autocorrelation of the onset envelope scored with a harmonic comb and a log-tempo prior that
-//      prefers 90–200 BPM; beats: dynamic-programming beat tracker (Ellis 2007); a robust linear fit of the
-//      beats gives a global grid (exact BPM + phase) when the song has a steady tempo, otherwise the tracked
-//      beats are used as a local grid;
-//   6. when the grid fits the onsets well, onsets are snapped to 1/4 beats (1/3 for clear triplets);
-//   7. per difficulty: candidates are scored by onset strength × section loudness (+ metrical position),
-//      then selected greedily with a minimum gap; the gap is widened by binary search until the map's
-//      computeStars() hits the target. Fast runs are marked `stream: true`; `placeNotes` decides positions.
+// Pipeline (pure JS, no dependencies; ≈ 0.3–0.8 s for a 3-minute song in Chrome):
+//   1. downmix to mono, decimate to ~22 kHz, loudness-normalise (RMS 0.1);
+//   2. STFT: 1024-point Hann, hop 256 (≈ 11.6 ms), small radix-2 real FFT; power pooled into ~12 bands
+//      per octave (30 Hz … 10 kHz) and log-compressed;
+//   3. spectral flux ("SuperFlux"-style: vs. a band-max-filtered frame two hops back) in three groups —
+//      low (< 200 Hz: kick/bass), mid (< 2.5 kHz: snare body, instruments, vocals), high (hats, noise);
+//   4. onset detection function = per-group-normalised weighted flux; adaptive threshold (moving mean
+//      + noise guard), peak picking, parabolic sub-frame timing;
+//   5. tempo: autocorrelation of the onset envelope scored with a harmonic comb × a log-tempo prior that
+//      prefers 90–200 BPM; beats: dynamic-programming beat tracker (Ellis 2007); global grid = period and
+//      phase with the most coherent beat phases (|Σ w·e^{2πit/p}|) refined by weighted least squares.
+//      Songs with tempo drift / changes keep the (smoothed) tracked beats as a local grid instead;
+//   6. if the grid agrees with the onsets (confidence), onsets are snapped to 1/4 beats (1/3, 1/8, 1/6 only
+//      when already very close) — never moved by more than 20 ms;
+//   7. per difficulty: candidates scored by onset strength × section loudness (+ metrical position), picked
+//      greedily with a minimum gap; the gap (≥ the difficulty's floor) is searched so that computeStars()
+//      lands near the target. Fast runs are marked `stream: true`; placeNotes() decides the positions.
 
 import { placeNotes } from './patterns.js';
 import { computeStars } from '../core/map.js';
 import { formatError } from './sspm.js';
 
 export const AUTO_DIFFICULTIES = [
-  { id: 'easy', name: 'Easy', stars: 1.2, minGap: 0.35, floor: 0.3 },
-  { id: 'normal', name: 'Normal', stars: 2.8, minGap: 0.22, floor: 0.2 },
-  { id: 'hard', name: 'Hard', stars: 4.8, minGap: 0.15, floor: 0.12 },
-  { id: 'insane', name: 'Insane', stars: 6.8, minGap: 0.09, floor: 0.06 },
-  { id: 'extreme', name: 'Extreme', stars: 9, minGap: 0.065, floor: 0.02 },
+  // stars: target computeStars(); minGap: s between notes; floor: min candidate score;
+  // maxRest: longer note-free stretches are filled with the best onsets inside them (if the music has any)
+  { id: 'easy', name: 'Easy', stars: 1.2, minGap: 0.35, floor: 0.3, maxRest: 3.0 },
+  { id: 'normal', name: 'Normal', stars: 2.8, minGap: 0.22, floor: 0.2, maxRest: 2.4 },
+  { id: 'hard', name: 'Hard', stars: 4.8, minGap: 0.15, floor: 0.12, maxRest: 2.0 },
+  { id: 'insane', name: 'Insane', stars: 6.8, minGap: 0.09, floor: 0.06, maxRest: 1.6 },
+  { id: 'extreme', name: 'Extreme', stars: 9, minGap: 0.065, floor: 0.02, maxRest: 1.4 },
 ];
 
 const N_FFT = 1024;
 const HOP = 256;
 // Systematic lag of flux peaks vs. the true onset for this window/hop/lag (measured on clicks and drums).
-const ONSET_BIAS_FRAMES = 0.0;
+const ONSET_BIAS_FRAMES = 0.25;
 
 const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -53,11 +57,12 @@ export async function autoMap(audio, opts = {}) {
   const t0 = now();
   const cands = scoreCandidates(rhythm);
   const maps = [];
-  let prevCount = 0;
+  const sorted = cands.slice().sort((a, b) => b.score - a.score);
+  let prev = null;
   for (let i = 0; i < difficulties.length; i++) {
     const d = difficulties[i];
-    const m = buildDifficulty(cands, d, rhythm, (seed ^ Math.imul(i + 1, 0x9e3779b1)) >>> 0, prevCount);
-    prevCount = m.notes.length;
+    const m = buildDifficulty(sorted, d, rhythm, (seed ^ Math.imul(i + 1, 0x9e3779b1)) >>> 0, prev);
+    prev = { count: m.notes.length, stars: m.stars };
     maps.push(m);
     onProgress && onProgress(0.7 + 0.3 * ((i + 1) / difficulties.length), 'maps');
     await tick();
@@ -118,8 +123,6 @@ export async function analyzeRhythm(audio, { onProgress = null } = {}) {
     beats: grid.beats,
     onsets,
     timings,
-    _energy: odf.energy,
-    _hopSec: F.hopSec,
   };
 }
 
@@ -141,7 +144,11 @@ function prepareSignal(audio) {
   const mono = new Float32Array(n);
   const nc = chans.length;
   const g = 1 / (nc * dec);
-  if (dec === 1) {
+  if (dec === 2 && nc <= 2) {
+    const l = chans[0], r = nc === 2 ? chans[1] : null;
+    if (r) for (let i = 0, j = 0; i < n; i++, j += 2) mono[i] = (l[j] + l[j + 1] + r[j] + r[j + 1]) * 0.25;
+    else for (let i = 0, j = 0; i < n; i++, j += 2) mono[i] = (l[j] + l[j + 1]) * 0.5;
+  } else if (dec === 1) {
     for (let c = 0; c < nc; c++) { const ch = chans[c]; for (let i = 0; i < n; i++) mono[i] += ch[i]; }
     if (nc > 1) for (let i = 0; i < n; i++) mono[i] /= nc;
   } else {
@@ -166,52 +173,75 @@ function prepareSignal(audio) {
 
 // ---- 2./3. STFT + band flux ------------------------------------------------------------------
 
-/** Real FFT magnitude of a length-N (power of two) frame, computed with an N/2 complex FFT. */
+/**
+ * Real FFT of a length-N frame (N a power of two) → power spectrum |X[k]|², k = 0..N/2.
+ * Computed with an N/2-point complex radix-2 FFT (first two stages fused into multiply-free radix-4
+ * butterflies) plus the usual even/odd split.
+ */
 export function makeRealFFT(N) {
   const M = N >> 1;
   const levels = Math.round(Math.log2(M));
-  if (1 << levels !== M) throw new Error('FFT size must be a power of two');
+  if (M < 4 || 1 << levels !== M) throw new Error('FFT size must be a power of two ≥ 8');
   const rev = new Uint32Array(M);
   for (let i = 0; i < M; i++) {
     let r = 0;
     for (let b = 0, x = i; b < levels; b++, x >>= 1) r = (r << 1) | (x & 1);
     rev[i] = r;
   }
-  const cosM = new Float64Array(M >> 1), sinM = new Float64Array(M >> 1);
-  for (let i = 0; i < M >> 1; i++) { cosM[i] = Math.cos((2 * Math.PI * i) / M); sinM[i] = Math.sin((2 * Math.PI * i) / M); }
+  const stages = [];
+  for (let size = 8; size <= M; size <<= 1) {
+    const half = size >> 1;
+    const c = new Float64Array(half), s = new Float64Array(half);
+    for (let k = 0; k < half; k++) { c[k] = Math.cos((2 * Math.PI * k) / size); s[k] = -Math.sin((2 * Math.PI * k) / size); }
+    stages.push({ size, half, c, s });
+  }
   const cosN = new Float64Array(M + 1), sinN = new Float64Array(M + 1);
-  for (let k = 0; k <= M; k++) { cosN[k] = Math.cos((2 * Math.PI * k) / N); sinN[k] = Math.sin((2 * Math.PI * k) / N); }
+  for (let k = 0; k <= M; k++) { cosN[k] = Math.cos((2 * Math.PI * k) / N); sinN[k] = -Math.sin((2 * Math.PI * k) / N); }
   const re = new Float64Array(M), im = new Float64Array(M);
 
-  /** input: length N real; outMag: length M + 1 (bins 0..N/2) */
-  return function fftMag(input, outMag) {
+  return function fftPower(input, outPow) {
     for (let i = 0; i < M; i++) { const j = rev[i]; re[j] = input[2 * i]; im[j] = input[2 * i + 1]; }
-    for (let size = 2; size <= M; size <<= 1) {
-      const half = size >> 1, step = M / size;
+    for (let a = 0; a < M; a += 4) {
+      const r0 = re[a], i0 = im[a], r1 = re[a + 1], i1 = im[a + 1];
+      const r2 = re[a + 2], i2 = im[a + 2], r3 = re[a + 3], i3 = im[a + 3];
+      const s0r = r0 + r1, s0i = i0 + i1, d0r = r0 - r1, d0i = i0 - i1;
+      const s1r = r2 + r3, s1i = i2 + i3, d1r = r2 - r3, d1i = i2 - i3;
+      re[a] = s0r + s1r; im[a] = s0i + s1i;
+      re[a + 2] = s0r - s1r; im[a + 2] = s0i - s1i;
+      re[a + 1] = d0r + d1i; im[a + 1] = d0i - d1r; // d1 · (−i)
+      re[a + 3] = d0r - d1i; im[a + 3] = d0i + d1r;
+    }
+    for (let st = 0; st < stages.length; st++) {
+      const { size, half, c, s } = stages[st];
       for (let start = 0; start < M; start += size) {
-        for (let k = 0, t = 0; k < half; k++, t += step) {
-          const wr = cosM[t], wi = -sinM[t];
+        for (let k = 0; k < half; k++) {
           const a = start + k, b = a + half;
-          const xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
-          re[b] = re[a] - xr; im[b] = im[a] - xi;
-          re[a] += xr; im[a] += xi;
+          const wr = c[k], wi = s[k];
+          const br = re[b], bi = im[b];
+          const xr = br * wr - bi * wi, xi = br * wi + bi * wr;
+          const ar = re[a], ai = im[a];
+          re[b] = ar - xr; im[b] = ai - xi;
+          re[a] = ar + xr; im[a] = ai + xi;
         }
       }
     }
-    // split the packed spectrum: E = (Z[k] + conj Z[M−k]) / 2, O = (Z[k] − conj Z[M−k]) / 2i, X = E + W^k O
+    // X[k] = E[k] + W^k·O[k], E = (Z[k] + conj Z[M−k]) / 2, O = (Z[k] − conj Z[M−k]) / 2i
     for (let k = 0; k <= M; k++) {
       const k1 = k === M ? 0 : k, k2 = k === 0 ? 0 : M - k;
       const zr = re[k1], zi = im[k1], cr = re[k2], ci = -im[k2];
       const er = (zr + cr) * 0.5, ei = (zi + ci) * 0.5;
-      const dr = (zr - cr) * 0.5, di = (zi - ci) * 0.5;
-      const or = di, oi = -dr;
-      const wr = cosN[k], wi = -sinN[k];
-      const xr = er + or * wr - oi * wi, xi = ei + or * wi + oi * wr;
-      outMag[k] = Math.sqrt(xr * xr + xi * xi);
+      const dr = (zr - cr) * 0.5, di = (zi - ci) * 0.5; // O = (di, −dr)
+      const wr = cosN[k], wi = sinN[k];
+      const xr = er + di * wr + dr * wi, xi = ei + di * wi - dr * wr;
+      outPow[k] = xr * xr + xi * xi;
     }
   };
 }
 
+/**
+ * STFT → per-frame features. The power spectrum is pooled into ~12 bands per octave (30 Hz … 10 kHz)
+ * before log compression: fewer logs, and band energies fluctuate far less than single bins on noise.
+ */
 function spectralFeatures(x, sr) {
   const N = N_FFT, H = HOP, M = N >> 1;
   const nFrames = Math.max(1, Math.floor(x.length / H) + 1);
@@ -219,18 +249,36 @@ function spectralFeatures(x, sr) {
   const fft = makeRealFFT(N);
   const win = new Float32Array(N);
   for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / N);
-  const bin = (f) => Math.max(1, Math.min(M, Math.round((f * N) / sr)));
-  const b0 = bin(30), b1 = bin(200), b2 = bin(2500), b3 = Math.min(bin(10000), M - 1);
-  const pLo = bin(120), pHi = bin(1400); // pitch search range (melody → note height)
+  const binOf = (f) => Math.max(1, Math.min(M, Math.round((f * N) / sr)));
+
+  // log-spaced filterbank (rectangular, each bin in exactly one band, every band ≥ 1 bin)
+  const edges = [binOf(30)];
+  const fMax = Math.min(10000, sr * 0.45);
+  for (let f = 30 * Math.pow(2, 1 / 12); f < fMax; f *= Math.pow(2, 1 / 12)) {
+    const b = binOf(f);
+    if (b > edges[edges.length - 1]) edges.push(b);
+  }
+  const nb = edges.length - 1;
+  const bandLo = Int32Array.from(edges.slice(0, -1)), bandHi = Int32Array.from(edges.slice(1));
+  const bandInvW = new Float64Array(nb);
+  const group = new Uint8Array(nb); // 0 low (< 200 Hz), 1 mid (< 2.5 kHz), 2 high
+  const count = [0, 0, 0];
+  for (let j = 0; j < nb; j++) {
+    bandInvW[j] = 1 / (bandHi[j] - bandLo[j]);
+    const fc = (((bandLo[j] + bandHi[j]) / 2) * sr) / N;
+    group[j] = fc < 200 ? 0 : fc < 2500 ? 1 : 2;
+    count[group[j]]++;
+  }
+  const inv = count.map((c) => (c ? 1 / c : 0));
+  const pLo = binOf(120), pHi = binOf(1400); // pitch search range (melody → note height)
+
   const frame = new Float32Array(N);
-  const mag = new Float32Array(M + 1);
-  // ring buffer of log spectra (current, −1, −2), max-filtered over ±1 bin for the reference
-  const ring = [new Float32Array(M + 1), new Float32Array(M + 1), new Float32Array(M + 1)];
+  const pow = new Float64Array(M + 1);
+  const ring = [new Float32Array(nb), new Float32Array(nb), new Float32Array(nb)];
   const low = new Float32Array(nFrames), mid = new Float32Array(nFrames), high = new Float32Array(nFrames);
   const energy = new Float32Array(nFrames);
   const pitch = new Float32Array(nFrames);
-  const GAMMA = globalThis.__AM_GAMMA ?? 20;
-  const invLo = 1 / (b1 - b0), invMid = 1 / (b2 - b1), invHi = 1 / (b3 - b2);
+  const G = 400; // log(1 + G·power): compression constant (signal is RMS-normalised to 0.1)
   for (let f = 0; f < nFrames; f++) {
     const start = f * H - (N >> 1); // frame f is centred on sample f·H
     if (start >= 0 && start + N <= x.length) {
@@ -238,28 +286,33 @@ function spectralFeatures(x, sr) {
     } else {
       for (let i = 0; i < N; i++) { const j = start + i; frame[i] = j >= 0 && j < x.length ? x[j] * win[i] : 0; }
     }
-    fft(frame, mag);
+    fft(frame, pow);
     const L = ring[f % 3];
     const R = ring[(f + 1) % 3]; // = frame f − 2
     let e = 0;
-    for (let k = 0; k <= b3; k++) { const m = mag[k]; e += m * m; L[k] = Math.log1p(GAMMA * m); }
+    for (let j = 0; j < nb; j++) {
+      let s = 0;
+      for (let k = bandLo[j], k1 = bandHi[j]; k < k1; k++) s += pow[k];
+      e += s;
+      L[j] = Math.log(1 + G * s * bandInvW[j]);
+    }
     energy[f] = e;
     if (f >= 2) {
-      let sl = 0, sm = 0, sh = 0;
-      for (let k = b0; k < b3; k++) {
-        let ref = R[k];
-        if (R[k - 1] > ref) ref = R[k - 1];
-        if (R[k + 1] > ref) ref = R[k + 1];
-        const d = L[k] - ref;
-        if (d > 0) { if (k < b1) sl += d; else if (k < b2) sm += d; else sh += d; }
+      const acc = [0, 0, 0];
+      for (let j = 0; j < nb; j++) {
+        let ref = R[j];
+        if (j > 0 && R[j - 1] > ref) ref = R[j - 1];
+        if (j < nb - 1 && R[j + 1] > ref) ref = R[j + 1];
+        const d = L[j] - ref;
+        if (d > 0) acc[group[j]] += d;
       }
-      low[f] = sl * invLo; mid[f] = sm * invMid; high[f] = sh * invHi;
+      low[f] = acc[0] * inv[0]; mid[f] = acc[1] * inv[1]; high[f] = acc[2] * inv[2];
     }
     // dominant pitch in the melody range, only when clearly tonal
     let best = 0, bk = 0, sum = 0;
-    for (let k = pLo; k <= pHi; k++) { const m = mag[k]; sum += m; if (m > best) { best = m; bk = k; } }
+    for (let k = pLo; k <= pHi; k++) { const p = pow[k]; sum += p; if (p > best) { best = p; bk = k; } }
     const avg = sum / (pHi - pLo + 1);
-    pitch[f] = best > 6 * avg && best > 1e-3 ? 69 + 12 * Math.log2(((bk * sr) / N) / 440) : 0;
+    pitch[f] = best > 20 * avg && best > 1e-6 ? 69 + 12 * Math.log2(((bk * sr) / N) / 440) : 0;
   }
   return { low, mid, high, energy, pitch, nFrames, hopSec, sr };
 }
@@ -312,9 +365,8 @@ function pickPeaks(odf, F) {
   const hop = F.hopSec;
   const wmax = Math.max(1, Math.round(0.03 / hop));
   const combine = Math.max(1, Math.round(0.025 / hop));
-  const DELTA = globalThis.__AM_DELTA ?? 0.06;
-  const medO = percentile(o, 0.5);
-  const thr = Math.max(DELTA, (globalThis.__AM_KMED ?? 0) * medO);
+  // absolute floor + a noise guard relative to the typical flux level of the song
+  const thr = Math.max(0.06, 0.3 * percentile(o, 0.5));
   const peaks = [];
   let last = -1e9;
   for (let i = 2; i < n - 1; i++) {
@@ -356,7 +408,7 @@ function pickPeaks(odf, F) {
 
 function estimateTempo(env, hop) {
   const n = env.length;
-  const minBpm = 55, maxBpm = 250;
+  const minBpm = 55;
   const maxLag = Math.min(n - 1, Math.ceil((4 * 60) / minBpm / hop) + 2);
   const r = new Float64Array(maxLag + 1);
   let mu = 0;
@@ -392,9 +444,7 @@ function estimateTempo(env, hop) {
     const den = a - 2 * best + c;
     if (den < 0) bestB += 0.25 * Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / den));
   }
-  const vals = scores.map((s) => s[1]).sort((p, q) => p - q);
-  const median = vals[vals.length >> 1] || 0;
-  return { bpm: bestB, periodFrames: 60 / bestB / hop, strength: best, peakiness: best > 0 ? 1 - median / best : 0 };
+  return { bpm: bestB, periodFrames: 60 / bestB / hop };
 }
 
 /** Dynamic-programming beat tracker (Ellis 2007). Returns beat frame indices. */
@@ -435,9 +485,9 @@ function trackBeats(env, P) {
 }
 
 /**
- * Fit a global tempo grid to the tracked beats (robust linear regression on beat index vs time).
- * Falls back to the tracked beats as a local grid when the tempo drifts; reports how well the
- * onsets agree with the grid (confidence 0..1).
+ * Turn tracked beats into a beat grid: a global one (exact period + phase) for steady songs, else the
+ * smoothed tracked beats (local grid). Reports how well the onsets agree with it (confidence 0..1;
+ * < 0.3 → mode 'none', no snapping).
  */
 function fitGrid(beatFrames, env, hop, tempo, peaks) {
   const n = env.length;
@@ -451,13 +501,36 @@ function fitGrid(beatFrames, env, hop, tempo, peaks) {
   const result = { bpm: round2(tempo.bpm), offset: 0, confidence: 0, mode: 'none', beats: times, period: P0 };
   if (times.length < 8) return result;
 
-  // beat indices from the gaps (tolerates skipped / doubled beats in breaks)
-  const idx = [0];
-  for (let i = 1; i < times.length; i++) idx.push(idx[i - 1] + Math.max(1, Math.round((times[i] - times[i - 1]) / P0)));
+  // 1) period + phase with the most coherent beat phases (weighted by onset strength at the beat):
+  //    R(p) = |Σ w·e^{2πi·t/p}|, searched ±1 % around the autocorrelation tempo, coarse → fine.
+  //    Using absolute phase (not beat counting) makes this immune to skipped / doubled beats in breaks.
   const w = beatFrames.map((b) => 0.2 + Math.min(3, env[b]));
+  const span = Math.max(1, times[times.length - 1] - times[0]);
+  const coherence = (q) => {
+    let cr = 0, ci = 0;
+    const k = (2 * Math.PI) / q;
+    for (let i = 0; i < times.length; i++) { const ang = times[i] * k; cr += w[i] * Math.cos(ang); ci += w[i] * Math.sin(ang); }
+    return [Math.hypot(cr, ci), Math.atan2(ci, cr)];
+  };
+  const fine = Math.max(1e-6, (0.01 * P0 * P0) / span);
+  let bestP = P0, bestR = -1, bestPh = 0;
+  const scan = (from, to, step) => {
+    for (let q = from; q <= to; q += step) {
+      const [R, ph] = coherence(q);
+      if (R > bestR) { bestR = R; bestP = q; bestPh = ph; }
+    }
+  };
+  scan(P0 * 0.99, P0 * 1.01, fine * 6);
+  scan(bestP - fine * 6, bestP + fine * 6, fine);
+  let p = bestP;
+  let a = (bestPh / (2 * Math.PI)) * p;
+  // 2) refine with a weighted least-squares line through the in-phase beats
   let inl = times.map(() => true);
-  let a = 0, p = P0;
-  for (let iter = 0; iter < 4; iter++) {
+  let idx = times.map((t) => Math.round((t - a) / p));
+  for (let iter = 0; iter < 3; iter++) {
+    const tol = Math.max(0.015, 0.06 * p);
+    idx = times.map((t) => Math.round((t - a) / p));
+    inl = times.map((t, i) => Math.abs(t - (a + p * idx[i])) < tol);
     let sw = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
     for (let i = 0; i < times.length; i++) {
       if (!inl[i]) continue;
@@ -466,10 +539,10 @@ function fitGrid(beatFrames, env, hop, tempo, peaks) {
     }
     const den = sw * sxx - sx * sx;
     if (!(den > 0)) break;
-    p = (sw * sxy - sx * sy) / den;
+    const p2 = (sw * sxy - sx * sy) / den;
+    if (!(Math.abs(p2 / p - 1) < 0.01)) break;
+    p = p2;
     a = (sy - p * sx) / sw;
-    const tol = Math.max(0.012, 0.06 * p) * (iter < 2 ? 2 : 1);
-    inl = times.map((t, i) => Math.abs(t - (a + p * idx[i])) < tol);
   }
   const globalBpm = 60 / p;
 
@@ -478,19 +551,58 @@ function fitGrid(beatFrames, env, hop, tempo, peaks) {
   const localPos = (t) => beatPosLocal(times, t, P0);
   const qGlobal = gridAgreement(peaks, globalPos, p);
   const qLocal = gridAgreement(peaks, localPos, P0);
-  const inlierFrac = inl.filter(Boolean).length / inl.length;
-  let mode, conf, pos, period;
+  let wIn = 0, wAll = 0;
+  for (let i = 0; i < times.length; i++) { wAll += w[i]; if (inl[i]) wIn += w[i]; }
+  const inlierFrac = wIn / wAll;
+  let mode, conf, period;
   if (Number.isFinite(globalBpm) && globalBpm > 40 && globalBpm < 400 && inlierFrac > 0.5 && qGlobal >= qLocal - 0.03) {
-    mode = 'global'; conf = qGlobal; pos = globalPos; period = p;
+    mode = 'global'; conf = qGlobal; period = p;
   } else {
-    mode = 'local'; conf = qLocal; pos = localPos; period = P0;
+    mode = 'local'; conf = qLocal; period = P0;
   }
   if (conf < 0.3) mode = 'none';
+  let beats = mode === 'global' ? times.map((_, i) => a + p * idx[i]) : smoothBeats(times, P0);
+  let posFn = mode === 'global' ? (t) => (t - a) / p : (t) => beatPosLocal(beats, t, P0);
+  // Beats come from the (smoothed) envelope, onsets from peak picking: align the grid's phase to the strong
+  // onsets themselves (weighted median of their distance to the nearest 1/4 point).
+  if (mode !== 'none') {
+    const res = [];
+    for (const pk of peaks) {
+      if (pk.strength < 0.4) continue;
+      const b = posFn(pk.t);
+      const r = (b - Math.round(b * 4) / 4) * period;
+      if (Math.abs(r) < Math.min(0.03, period / 10)) res.push(r);
+    }
+    if (res.length >= 8) {
+      res.sort((x, y) => x - y);
+      const shift = res[res.length >> 1];
+      if (mode === 'global') { a += shift; posFn = (t) => (t - a) / p; beats = beats.map((t) => t + shift); }
+      else { beats = beats.map((t) => t + shift); posFn = (t) => beatPosLocal(beats, t, P0); }
+    }
+  }
   const bpm = mode === 'global' ? globalBpm : tempo.bpm;
-  let offset = mode === 'global' ? a : times[0];
+  let offset = mode === 'global' ? a : beats[0];
   offset = ((offset % period) + period) % period;
-  const beats = mode === 'global' ? times.map((_, i) => a + p * idx[i]) : times;
-  return { bpm: round2(bpm), offset: round4(offset), confidence: round2(Math.max(0, conf)), mode, beats, period, pos, a, p, times };
+  return { bpm: round2(bpm), offset: round4(offset), confidence: round2(Math.max(0, conf)), mode, beats, period, pos: posFn, a, p, times: beats };
+}
+
+/** Remove frame-quantisation jitter from tracked beats: local line fit over ±3 beats where the tempo is steady. */
+function smoothBeats(times, P0) {
+  const n = times.length;
+  const out = times.slice();
+  const R = 3;
+  for (let i = 0; i < n; i++) {
+    const lo = Math.max(0, i - R), hi = Math.min(n - 1, i + R);
+    if (hi - lo < 3) continue;
+    let steady = true;
+    for (let j = lo + 1; j <= hi; j++) { const d = times[j] - times[j - 1]; if (Math.abs(d / P0 - 1) > 0.15) { steady = false; break; } }
+    if (!steady) continue;
+    let sx = 0, sy = 0, sxx = 0, sxy = 0, m = 0;
+    for (let j = lo; j <= hi; j++) { const x = j - i; sx += x; sy += times[j]; sxx += x * x; sxy += x * times[j]; m++; }
+    const den = m * sxx - sx * sx;
+    if (den > 0) out[i] = (sy - ((m * sxy - sx * sy) / den) * sx) / m; // intercept at x = 0
+  }
+  return out;
 }
 
 function beatPosLocal(times, t, P0) {
@@ -528,24 +640,30 @@ function gridAgreement(peaks, posFn, period) {
 
 // ---- 6. snapping -----------------------------------------------------------------------------
 
+// [subdivision per beat, max distance in seconds]
+const SNAP_GRIDS = [[4, 0.02], [3, 0.015], [8, 0.01], [6, 0.008]];
+
 function snapOnsets(peaks, grid) {
   const out = [];
   const snap = grid.mode !== 'none';
   const period = grid.period;
+  const tolScale = grid.mode === 'global' ? 1 : 0.6; // a tracked (local) grid is less exact
   for (const pk of peaks) {
     let t = pk.t, beatPos = null, snapped = false;
     if (snap) {
       const b = grid.pos(pk.t);
-      const q4 = Math.round(b * 4) / 4, q3 = Math.round(b * 3) / 3;
-      const d4 = Math.abs(b - q4) * period, d3 = Math.abs(b - q3) * period;
-      let q = null;
-      if (d4 <= Math.min(0.035, 0.1 * period)) q = q4;
-      else if (d3 <= Math.min(0.02, 0.06 * period)) q = q3;
-      if (q != null) {
-        t = grid.mode === 'global' ? grid.a + grid.p * q : beatTimeLocal(grid.times, q, period);
-        beatPos = q;
-        snapped = true;
-      } else beatPos = b;
+      // coarse grids first; finer subdivisions only for onsets that are already very close to them
+      for (const [div, tolMs] of SNAP_GRIDS) {
+        const q = Math.round(b * div) / div;
+        const d = Math.abs(b - q) * period;
+        if (d <= tolMs * tolScale) {
+          t = grid.mode === 'global' ? grid.a + grid.p * q : beatTimeLocal(grid.times, q, period);
+          beatPos = q;
+          snapped = true;
+          break;
+        }
+      }
+      if (!snapped) beatPos = b;
     }
     out.push({
       t: round4(Math.max(0, t)), raw: round4(pk.t), strength: pk.strength, snapped, beatPos,
@@ -581,13 +699,16 @@ function scoreCandidates(rhythm) {
   });
 }
 
-/** Greedy selection by score with a minimum gap; returns time-sorted items. */
-function selectNotes(cands, gap, floor) {
-  const order = cands.filter((c) => c.score >= floor).sort((a, b) => b.score - a.score);
+/**
+ * Greedy selection by score with a minimum gap. `sorted` = candidates by score, descending.
+ * Returns the accepted candidates in acceptance (= score) order: any prefix of it also respects the gap.
+ */
+function selectOrder(sorted, gap, floor) {
   const buckets = new Map();
   const chosen = [];
   const eps = 1e-6;
-  for (const c of order) {
+  for (const c of sorted) {
+    if (c.score < floor) break;
     const k = Math.floor(c.t / gap);
     let ok = true;
     for (let j = k - 1; j <= k + 1 && ok; j++) {
@@ -599,8 +720,39 @@ function selectNotes(cands, gap, floor) {
     if (arr) arr.push(c.t); else buckets.set(k, [c.t]);
     chosen.push(c);
   }
-  chosen.sort((a, b) => a.t - b.t);
   return chosen;
+}
+
+const byTime = (a, b) => a.t - b.t;
+
+/**
+ * Fill long note-free stretches (quiet intros / breakdowns that lost to louder sections) with the
+ * best-scoring onsets inside them, keeping the minimum gap. `pool` = candidates sorted by time.
+ */
+function fillRests(sel, pool, poolT, gap, maxRest) {
+  if (!pool.length || !(maxRest > 0)) return sel;
+  const out = sel.slice();
+  const lowerBound = (t) => { let lo = 0, hi = poolT.length; while (lo < hi) { const m = (lo + hi) >> 1; if (poolT[m] < t) lo = m + 1; else hi = m; } return lo; };
+  const stack = [];
+  const edges = [pool[0].t - gap - 1e-6, ...out.map((c) => c.t), pool[pool.length - 1].t + gap + 1e-6];
+  for (let i = 1; i < edges.length; i++) if (edges[i] - edges[i - 1] > maxRest) stack.push([edges[i - 1], edges[i]]);
+  let guard = 0;
+  while (stack.length && guard++ < 5000) {
+    const [a, b] = stack.pop();
+    let best = null;
+    for (let j = lowerBound(a + gap); j < pool.length && pool[j].t <= b - gap; j++) {
+      const c = pool[j];
+      // prefer strong onsets near the middle of the rest
+      const mid = 1 - Math.abs((c.t - a) / (b - a) - 0.5);
+      const v = c.score * (0.6 + 0.4 * mid);
+      if (!best || v > best.v) best = { c, v };
+    }
+    if (!best) continue;
+    out.push(best.c);
+    if (best.c.t - a > maxRest) stack.push([a, best.c.t]);
+    if (b - best.c.t > maxRest) stack.push([best.c.t, b]);
+  }
+  return out.length === sel.length ? sel : out.sort(byTime);
 }
 
 function toTimes(sel, period) {
@@ -623,42 +775,71 @@ function toTimes(sel, period) {
   return out;
 }
 
-function buildDifficulty(cands, diff, rhythm, seed, prevCount) {
+/**
+ * Pick the note subset for one difficulty. The minimum gap (≥ the difficulty's floor gap) is the main
+ * knob: widening it thins the densest passages first while leaving sparse sections intact. Candidate
+ * gaps are tried on a geometric ladder (+ a refinement step) and the map whose computeStars() is closest
+ * to the target wins; a map that is not denser than the previous difficulty is heavily penalised.
+ */
+function buildDifficulty(sorted, diff, rhythm, seed, prev) {
   const period = rhythm.bpm > 0 ? 60 / rhythm.bpm : 0.5;
-  const evalAt = (gap, floor) => {
-    const sel = selectNotes(cands, gap, floor);
-    const times = toTimes(sel, period);
-    const notes = placeNotes(times, { stars: diff.stars, seed });
-    return { notes, stars: computeStars(notes), gap, floor };
+  const orders = new Map();
+  const order = (gap, floor) => {
+    const key = gap.toFixed(5) + '|' + floor;
+    if (!orders.has(key)) orders.set(key, selectOrder(sorted, gap, floor));
+    return orders.get(key);
   };
-  let best = evalAt(diff.minGap, diff.floor);
-  if (best.stars < diff.stars || best.notes.length < prevCount) {
-    // not hard enough even at the densest allowed spacing: also take the weaker onsets
-    const all = evalAt(diff.minGap, 0);
-    if (all.notes.length >= best.notes.length) best = all;
-  } else {
-    // too hard: widen the minimum gap (thins the densest passages first) until the stars fit
-    let lo = diff.minGap, hi = Math.max(diff.minGap * 6, 2);
-    let within = best;
-    for (let it = 0; it < 12; it++) {
-      const g = Math.sqrt(lo * hi);
-      const r = evalAt(g, diff.floor);
-      if (r.stars > diff.stars) lo = g;
-      else { hi = g; within = r; }
-      if (hi / lo < 1.03) break;
+  const pool = sorted.filter((c) => c.strength >= 0.15).sort(byTime);
+  const poolT = pool.map((c) => c.t);
+  const evalAt = (gap, floor, sd = seed, count = Infinity) => {
+    const all = order(gap, floor);
+    const sel = fillRests((count < all.length ? all.slice(0, count) : all.slice()).sort(byTime), pool, poolT, gap, diff.maxRest);
+    const notes = placeNotes(toTimes(sel, period), { stars: diff.stars, seed: sd });
+    return { notes, stars: notes.length > 1 ? computeStars(notes) : 0, gap, floor, seed: sd, count };
+  };
+  // distance to the target stars (overshooting is worse), must not be sparser than the easier difficulty
+  const cost = (r) => {
+    let c = Math.abs(r.stars - diff.stars) + (r.stars > diff.stars ? 0.25 * (r.stars - diff.stars) : 0);
+    if (prev) {
+      if (r.notes.length < prev.count) c += 20;
+      else if (r.notes.length === prev.count) c += 3;
+      if (r.stars <= prev.stars) c += 2;
     }
-    best = within;
-    // never sparser than the easier difficulty
-    if (best.notes.length < prevCount) {
-      const denser = evalAt(lo, diff.floor);
-      if (denser.notes.length >= prevCount) best = denser;
-    }
+    if (r.notes.length < 2) c += 100;
+    return c;
+  };
+  let best = null, bestCost = Infinity;
+  const consider = (r) => { const c = cost(r); if (c < bestCost) { best = r; bestCost = c; } return r; };
+
+  // A) widen the minimum gap on a geometric ladder: thins the densest passages first
+  const STEPS = 9, RANGE = 8;
+  const ratio = Math.pow(RANGE, 1 / (STEPS - 1));
+  for (let i = 0; i < STEPS; i++) consider(evalAt(diff.minGap * Math.pow(ratio, i), diff.floor));
+  if (best.stars < diff.stars) consider(evalAt(diff.minGap, Math.min(diff.floor, 0.05))); // sparse songs: weak onsets too
+  let step = Math.sqrt(ratio);
+  for (let k = 0; k < 2 && best.gap > diff.minGap * 1.0001; k++, step = Math.sqrt(step)) {
+    const g = best.gap, fl = best.floor;
+    consider(evalAt(Math.max(diff.minGap, g / step), fl));
+    consider(evalAt(g * step, fl));
   }
-  const notes = best.notes.map((n) => ({ t: n.t, x: n.x, y: n.y }));
+  // B) keep the tightest gap but only the k best-scoring notes (drops weak / quiet-section notes first);
+  //    stars grow ~monotonically with k → bisection. Gives the in-between densities the ladder skips.
+  const full = order(diff.minGap, diff.floor).length;
+  let lo = Math.min(full, Math.max(2, Math.round((prev ? prev.count : 0) * 0.9))), hi = full;
+  for (let it = 0; it < 8 && hi - lo > 2; it++) {
+    const k = (lo + hi) >> 1;
+    const r = consider(evalAt(diff.minGap, diff.floor, seed, k));
+    if (r.stars > diff.stars) hi = k; else lo = k;
+  }
+  // placement randomness moves the stars too: try alternative floors / pattern seeds around the winner
+  const g = best.gap, fl = best.floor, cnt = best.count;
+  if (cnt === Infinity) { consider(evalAt(g, fl * 0.5)); consider(evalAt(g, fl * 1.8)); }
+  consider(evalAt(g, fl, (seed ^ 0x5bd1e995) >>> 0, cnt));
+  consider(evalAt(g, fl, (seed ^ 0x27d4eb2f) >>> 0, cnt));
   return {
     difficultyId: diff.id,
     difficultyName: diff.name,
-    notes,
+    notes: best.notes.map((n) => ({ t: n.t, x: n.x, y: n.y })),
     stars: Math.round(best.stars * 100) / 100,
     minGap: round4(best.gap),
   };

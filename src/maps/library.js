@@ -118,6 +118,11 @@ export class MapLibrary extends Emitter {
     this.emit('change');
   }
 
+  /** Seed the audio cache (e.g. the importer already decoded the file for auto-mapping). */
+  primeAudioBuffer(setId, audioBuffer) {
+    if (audioBuffer) this._buffers.set(setId, audioBuffer);
+  }
+
   /** AudioBuffer for a map's set (renders procedural music on first use). null if the map has no audio. */
   async getAudioBuffer(mapOrSet, onProgress) {
     const set = mapOrSet.maps ? mapOrSet : this.getSet(mapOrSet.setId);
