@@ -1,0 +1,17 @@
+{
+  "name": "muxa-rhythia-ai",
+  "version": "1.0.0",
+  "description": "Rhythia-style aim rhythm game in the browser + МУХА, a neural network that learns to play it live.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node tools/build.mjs --serve",
+    "build": "node tools/build.mjs",
+    "train": "node tools/train.mjs",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright-core": "1.56"
+  }
+}
