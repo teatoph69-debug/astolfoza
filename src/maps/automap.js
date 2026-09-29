@@ -229,7 +229,7 @@ function spectralFeatures(x, sr) {
   const low = new Float32Array(nFrames), mid = new Float32Array(nFrames), high = new Float32Array(nFrames);
   const energy = new Float32Array(nFrames);
   const pitch = new Float32Array(nFrames);
-  const GAMMA = 20;
+  const GAMMA = globalThis.__AM_GAMMA ?? 20;
   const invLo = 1 / (b1 - b0), invMid = 1 / (b2 - b1), invHi = 1 / (b3 - b2);
   for (let f = 0; f < nFrames; f++) {
     const start = f * H - (N >> 1); // frame f is centred on sample f·H
@@ -312,12 +312,14 @@ function pickPeaks(odf, F) {
   const hop = F.hopSec;
   const wmax = Math.max(1, Math.round(0.03 / hop));
   const combine = Math.max(1, Math.round(0.025 / hop));
-  const DELTA = 0.06;
+  const DELTA = globalThis.__AM_DELTA ?? 0.06;
+  const medO = percentile(o, 0.5);
+  const thr = Math.max(DELTA, (globalThis.__AM_KMED ?? 0) * medO);
   const peaks = [];
   let last = -1e9;
   for (let i = 2; i < n - 1; i++) {
     const v = o[i];
-    if (v - mean[i] < DELTA) continue;
+    if (v - mean[i] < thr) continue;
     let isMax = true;
     for (let k = Math.max(0, i - wmax); k <= Math.min(n - 1, i + wmax); k++) {
       if (o[k] > v || (o[k] === v && k < i)) { isMax = false; break; }
